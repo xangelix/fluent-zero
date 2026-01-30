@@ -1,5 +1,9 @@
 # fluent-zero
 
+[![Crates.io](https://img.shields.io/crates/v/fluent-zero)](https://crates.io/crates/fluent-zero)
+[![Docs.rs](https://docs.rs/fluent-zero/badge.svg)](https://docs.rs/fluent-zero)
+[![License](https://img.shields.io/crates/l/fluent-zero)](https://spdx.org/licenses/MIT)
+
 **Zero-allocation, high-performance Fluent localization for Rust.**
 
 `fluent-zero` is a specialized localization loader designed for high-performance applications, such as **GUI clients** (egui, iced, winit) and **Game Development** (Bevy, Fyrox).
