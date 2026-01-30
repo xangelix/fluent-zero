@@ -4,9 +4,9 @@
 [![Docs.rs](https://docs.rs/fluent-zero/badge.svg)](https://docs.rs/fluent-zero)
 [![License](https://img.shields.io/crates/l/fluent-zero)](https://spdx.org/licenses/MIT)
 
-**Zero-allocation, high-performance Fluent localization for Rust.**
+**Zero-allocation, high-performance [Fluent](https://projectfluent.org/) localization for Rust.**
 
-`fluent-zero` is a specialized localization loader designed for high-performance applications, such as **GUI clients** (egui, iced, winit) and **Game Development** (Bevy, Fyrox).
+`fluent-zero` is a specialized localization loader designed for high-performance applications, such as **GUI clients** ([egui](https://egui.rs/), [iced](https://iced.rs/), [winit](https://github.com/rust-windowing/winit)) and **Game Development** ([Bevy](https://bevy.org/), [Fyrox](https://fyrox.rs/)).
 
 Unlike other loaders that prioritize template engine integration or hot-reloading, `fluent-zero` prioritizes **runtime speed and memory efficiency**. It generates static code at build time to allow for `O(1)` lookups that return `&'static str` whenever possible, eliminating the heap allocation overhead typical of localization libraries.
 
@@ -181,4 +181,4 @@ While `fluent-zero` is faster at runtime, it comes with trade-offs compared to `
 
 ## License
 
-This project is licensed under the MIT license.
+This project is licensed under the [MIT license](https://spdx.org/licenses/MIT).
