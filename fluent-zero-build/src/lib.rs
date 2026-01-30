@@ -1,9 +1,6 @@
-// fluent-zero-build/src/lib.rs
+use std::{env, fs, io::Write as _, path::Path};
+
 use fluent_syntax::parser;
-use std::env;
-use std::fs;
-use std::io::Write;
-use std::path::Path;
 use unic_langid::LanguageIdentifier;
 
 /// Generates the static cache code for `fluent-zero`.
@@ -23,6 +20,7 @@ use unic_langid::LanguageIdentifier;
 /// # Arguments
 ///
 /// * `locales_dir_path` - Relative path to the folder containing locale subdirectories.
+#[allow(clippy::too_many_lines)]
 pub fn generate_static_cache(locales_dir_path: &str) {
     println!("cargo:rerun-if-changed={locales_dir_path}");
 

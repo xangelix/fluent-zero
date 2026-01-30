@@ -1,4 +1,3 @@
-// fluent-zero/src/lib.rs
 //! # fluent-zero
 //!
 //! A zero-allocation, high-performance Fluent localization loader designed for
@@ -19,16 +18,13 @@ use std::{
 };
 
 use arc_swap::ArcSwap;
+
 pub use fluent_bundle::{
     FluentArgs, FluentResource, concurrent::FluentBundle as ConcurrentFluentBundle,
 };
 pub use fluent_syntax;
 pub use phf;
 pub use unic_langid::LanguageIdentifier;
-
-// =========================================================================
-// 1. UNIFIED CACHE TYPES
-// =========================================================================
 
 /// Represents the result of a cache lookup from the generated PHF map.
 ///
@@ -47,14 +43,10 @@ pub enum CacheEntry {
     Dynamic,
 }
 
-// =========================================================================
-// 2. GLOBAL STATE
-// =========================================================================
-
 /// Internal state holding the currently active language configuration.
 pub struct LocaleState {
     /// The parsed identifier (e.g., `en-US`).
-    id: LanguageIdentifier,
+    _id: LanguageIdentifier,
     /// The string representation used for cache keys (e.g., "en-US").
     key: String,
 }
@@ -67,7 +59,7 @@ static CURRENT_LANG: LazyLock<ArcSwap<LocaleState>> = LazyLock::new(|| {
     let id: LanguageIdentifier = "en-US".parse().unwrap();
     ArcSwap::from_pointee(LocaleState {
         key: id.to_string(),
-        id,
+        _id: id,
     })
 });
 
@@ -84,7 +76,7 @@ static FALLBACK_LANG_KEY: &str = "en-US";
 /// * `lang` - The new `LanguageIdentifier` to set (e.g., parsed from "fr-FR").
 pub fn set_lang(lang: LanguageIdentifier) {
     let key = lang.to_string();
-    let new_state = LocaleState { id: lang, key };
+    let new_state = LocaleState { _id: lang, key };
     CURRENT_LANG.store(Arc::new(new_state));
 }
 
@@ -95,10 +87,6 @@ pub fn set_lang(lang: LanguageIdentifier) {
 pub fn get_lang() -> arc_swap::Guard<std::sync::Arc<LocaleState>> {
     CURRENT_LANG.load()
 }
-
-// =========================================================================
-// 3. TRAIT ABSTRACTIONS
-// =========================================================================
 
 /// A store that maps `(Locale, Key)` to a `CacheEntry`.
 ///
@@ -141,10 +129,6 @@ impl<S: BuildHasher + Sync + Send> BundleCollection
     }
 }
 
-// =========================================================================
-// 4. LOOKUP HELPER (STATIC)
-// =========================================================================
-
 /// Retrieves a localized message without arguments.
 ///
 /// This function attempts to return a `Cow::Borrowed` referencing static binary data
@@ -169,7 +153,7 @@ pub fn lookup_static<'a, B: BundleCollection + ?Sized, C: CacheStore + ?Sized>(
     let current_key = &get_lang().key;
     let is_fallback = current_key == FALLBACK_LANG_KEY;
 
-    // --- STEP 1: CURRENT LANGUAGE ---
+    // CURRENT LANGUAGE
     if let Some(entry) = cache.get_entry(current_key, key) {
         match entry {
             CacheEntry::Static(s) => return Cow::Borrowed(s),
@@ -183,7 +167,7 @@ pub fn lookup_static<'a, B: BundleCollection + ?Sized, C: CacheStore + ?Sized>(
         }
     }
 
-    // --- STEP 2: FALLBACK LANGUAGE ---
+    // FALLBACK LANGUAGE
     if !is_fallback && let Some(entry) = cache.get_entry(FALLBACK_LANG_KEY, key) {
         match entry {
             CacheEntry::Static(s) => return Cow::Borrowed(s),
@@ -199,10 +183,6 @@ pub fn lookup_static<'a, B: BundleCollection + ?Sized, C: CacheStore + ?Sized>(
 
     Cow::Borrowed(key)
 }
-
-// =========================================================================
-// 5. LOOKUP DYNAMIC
-// =========================================================================
 
 /// Retrieves a localized message with arguments.
 ///
@@ -225,7 +205,7 @@ pub fn lookup_dynamic<'a, B: BundleCollection + ?Sized, C: CacheStore + ?Sized>(
     let current_key = &get_lang().key;
     let is_fallback = current_key == FALLBACK_LANG_KEY;
 
-    // --- STEP 1: CURRENT LANGUAGE ---
+    // CURRENT LANGUAGE
     if let Some(entry) = cache.get_entry(current_key, key) {
         match entry {
             // Even if args are provided, if it's static, ignore args and return static string (Zero alloc)
@@ -240,7 +220,7 @@ pub fn lookup_dynamic<'a, B: BundleCollection + ?Sized, C: CacheStore + ?Sized>(
         }
     }
 
-    // --- STEP 2: FALLBACK LANGUAGE ---
+    // FALLBACK LANGUAGE
     if !is_fallback && let Some(entry) = cache.get_entry(FALLBACK_LANG_KEY, key) {
         match entry {
             CacheEntry::Static(s) => return Cow::Borrowed(s),
