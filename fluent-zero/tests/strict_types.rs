@@ -1,4 +1,3 @@
-// fluent-zero/tests/strict_types.rs
 use std::{borrow::Cow, collections::HashMap};
 
 // Imports
@@ -111,6 +110,7 @@ fn t01_static_hit_returns_borrowed() {
     let result = lookup_static(&mocks.bundles, &mocks.cache, "hello");
 
     assert_eq!(result, "Hello World");
+
     // CRITICAL: Ensure we did not allocate a new string
     assert!(matches!(result, Cow::Borrowed(_)));
 }
