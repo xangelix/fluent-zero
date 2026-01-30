@@ -1,3 +1,7 @@
+## v0.1.2
+
+Small, miscellaneous documentation improvements and fixes.
+
 ## v0.1.1
 
 Hotfix:
