@@ -182,3 +182,7 @@ While `fluent-zero` is faster at runtime, it comes with trade-offs compared to `
 ## License
 
 This project is licensed under the [MIT license](https://spdx.org/licenses/MIT).
+
+## Notice
+
+This crate is not related to [Mozilla Project Fluent](https://projectfluent.org/) in any official capacity. All usage is at your own risk.
