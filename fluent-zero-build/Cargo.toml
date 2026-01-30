@@ -5,6 +5,8 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 readme = "../README.md"
+documentation = "https://docs.rs/fluent-zero-build"
+repository = "https://github.com/xangelix/fluent-zero-build"
 categories = [
     "localization",
     "internationalization",
