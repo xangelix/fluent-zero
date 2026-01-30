@@ -1,0 +1,22 @@
+[package]
+name = "fluent-zero"
+description = "A zero-allocation, high-performance Fluent localization loader optimized for GUIs and games via compile-time caching to return &'static str for static messages."
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+readme = "../README.md"
+categories = [
+    "localization",
+    "internationalization",
+    "gui",
+    "caching",
+    "game-development",
+]
+keywords = ["fluent", "i18n", "zero-allocation", "static", "l10n"]
+
+[dependencies]
+arc-swap = "1"
+fluent-bundle = "0.16"
+fluent-syntax = "0.12"
+phf = { version = "0.13", features = ["macros"] }
+unic-langid = "0.9"

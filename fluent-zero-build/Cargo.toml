@@ -1,0 +1,20 @@
+[package]
+name = "fluent-zero-build"
+description = "Build-time code generator for fluent-zero. It compiles Fluent (.ftl) files into static, zero-allocation Rust code and Perfect Hash Maps."
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+readme = "../README.md"
+categories = [
+    "localization",
+    "internationalization",
+    "gui",
+    "caching",
+    "game-development",
+]
+keywords = ["fluent", "i18n", "zero-allocation", "static", "l10n"]
+
+[dependencies]
+fluent-syntax = "0.12"
+unic-langid = "0.9"
+phf_codegen = "0.13"
