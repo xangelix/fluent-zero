@@ -20,5 +20,5 @@ keywords = ["fluent", "i18n", "zero-allocation", "static", "l10n"]
 arc-swap = "1"
 fluent-bundle = "0.16"
 fluent-syntax = "0.12"
-phf = { version = "0.13", features = ["macros"] }
+phf = { version = "0.14", features = ["macros"] }
 unic-langid = "0.9"
