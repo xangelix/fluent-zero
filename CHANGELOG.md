@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.1.5
+
+- **Avoid Redundant Rebuilds:** `fluent-zero-build` now only writes the character set file if its content has actually changed, preserving file modification timestamps and preventing unnecessary rebuilds on every Cargo invocation.
+- **Dependency Upgrades:** Upgraded `phf` and `phf_codegen` to `0.14`.
+- **CI & Repository Maintenance:** Added GitHub Actions CI workflow for `cargo fmt` and `cargo test`, `.editorconfig`, and funding metadata.
+
 ## v0.1.4
 
 **Enterprise Font Subsetting (DAG IPC)**
