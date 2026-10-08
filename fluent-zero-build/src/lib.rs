@@ -266,7 +266,7 @@ impl FluentZeroBuilder {
         // Cargo automatically captures this and converts it into `DEP_<LINKS>_FLUENT_CHARSET_PATH`.
         // We write to a file rather than passing the string to bypass Windows 32KB limits.
         let internal_dest = Path::new(out_dir).join("fluent_charset_internal.txt");
-        if fs::write(&internal_dest, &charset_string).is_ok() {
+        if write_if_changed(&internal_dest, &charset_string).is_ok() {
             println!("cargo:fluent_charset_path={}", internal_dest.display());
         }
 
@@ -274,7 +274,8 @@ impl FluentZeroBuilder {
             if let Some(parent) = charset_dest.parent() {
                 let _ = fs::create_dir_all(parent);
             }
-            fs::write(charset_dest, &charset_string).expect("Failed to write fluent charset file");
+            write_if_changed(charset_dest, &charset_string)
+                .expect("Failed to write fluent charset file");
             println!("cargo:rerun-if-changed={}", charset_dest.display());
         }
     }
@@ -283,4 +284,19 @@ impl FluentZeroBuilder {
 /// Generates the static cache code for `fluent-zero`.
 pub fn generate_static_cache(locales_dir_path: &str) {
     FluentZeroBuilder::new(locales_dir_path).generate();
+}
+
+/// Writes `contents` to `path` only when it differs from what is already
+/// there, so an unchanged file keeps its modification time.
+///
+/// Cargo compares a `rerun-if-changed` path against the time the build
+/// script STARTED: a file the script rewrites on every run is always newer,
+/// so the script (and the crate depending on its output) re-ran on every
+/// cargo invocation. Unchanged content is now left untouched; a changed or
+/// deleted file is still (re)written, exactly as before.
+fn write_if_changed(path: &Path, contents: &str) -> std::io::Result<()> {
+    if fs::read_to_string(path).is_ok_and(|existing| existing == contents) {
+        return Ok(());
+    }
+    fs::write(path, contents)
 }
