@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use fluent_syntax::parser;
+use fluent_syntax::{ast, parser, unicode::unescape_unicode_to_string};
 use unic_langid::LanguageIdentifier;
 
 /// A builder to configure and generate the static cache code for `fluent-zero`.
@@ -72,7 +72,7 @@ impl FluentZeroBuilder {
                 && env_key.ends_with("_FLUENT_CHARSET_PATH")
                 && let Ok(content) = fs::read_to_string(&env_val)
             {
-                unique_chars.extend(content.chars().filter(|c| !c.is_control()));
+                extend_visible(&mut unique_chars, &content);
             }
         }
 
@@ -150,9 +150,14 @@ impl FluentZeroBuilder {
 
                 let ast = parser::parse(source).expect("Failed to parse FTL");
                 for entry in ast.body {
-                    if let fluent_syntax::ast::Entry::Message(msg) = entry {
-                        Self::harvest_chars(&msg, unique_chars);
-                        cache_entries.push((msg.id.name.clone(), Self::generate_cache_entry(&msg)));
+                    match entry {
+                        ast::Entry::Message(msg) => {
+                            harvest_message_chars(&msg, unique_chars);
+                            cache_entries
+                                .push((msg.id.name.clone(), Self::generate_cache_entry(&msg)));
+                        }
+                        ast::Entry::Term(term) => harvest_term_chars(&term, unique_chars),
+                        _ => {}
                     }
                 }
             }
@@ -161,19 +166,10 @@ impl FluentZeroBuilder {
         (combined_ftl_source, cache_entries)
     }
 
-    fn harvest_chars(msg: &fluent_syntax::ast::Message<String>, unique_chars: &mut BTreeSet<char>) {
-        let Some(pattern) = &msg.value else { return };
-        for element in &pattern.elements {
-            if let fluent_syntax::ast::PatternElement::TextElement { value } = element {
-                unique_chars.extend(value.chars().filter(|c| !c.is_control()));
-            }
-        }
-    }
-
-    fn generate_cache_entry(msg: &fluent_syntax::ast::Message<String>) -> String {
+    fn generate_cache_entry(msg: &ast::Message<String>) -> String {
         if let Some(pattern) = &msg.value
             && pattern.elements.len() == 1
-            && let fluent_syntax::ast::PatternElement::TextElement { value } = &pattern.elements[0]
+            && let ast::PatternElement::TextElement { value } = &pattern.elements[0]
             && !value.contains('\\')
         {
             format!("::fluent_zero::CacheEntry::Static(\"{value}\")")
@@ -281,6 +277,82 @@ impl FluentZeroBuilder {
     }
 }
 
+/// Collects every character a message can render: its value, all of its
+/// attributes, and every branch of any select expression inside them.
+fn harvest_message_chars(msg: &ast::Message<String>, unique_chars: &mut BTreeSet<char>) {
+    if let Some(pattern) = &msg.value {
+        harvest_pattern_chars(pattern, unique_chars);
+    }
+    for attribute in &msg.attributes {
+        harvest_pattern_chars(&attribute.value, unique_chars);
+    }
+}
+
+/// Terms are never looked up directly, but their text is spliced into any
+/// message that references them, so it is rendered all the same.
+fn harvest_term_chars(term: &ast::Term<String>, unique_chars: &mut BTreeSet<char>) {
+    harvest_pattern_chars(&term.value, unique_chars);
+    for attribute in &term.attributes {
+        harvest_pattern_chars(&attribute.value, unique_chars);
+    }
+}
+
+fn harvest_pattern_chars(pattern: &ast::Pattern<String>, unique_chars: &mut BTreeSet<char>) {
+    for element in &pattern.elements {
+        match element {
+            ast::PatternElement::TextElement { value } => extend_visible(unique_chars, value),
+            ast::PatternElement::Placeable { expression } => {
+                harvest_expression_chars(expression, unique_chars);
+            }
+        }
+    }
+}
+
+fn harvest_expression_chars(
+    expression: &ast::Expression<String>,
+    unique_chars: &mut BTreeSet<char>,
+) {
+    match expression {
+        // Every variant can be rendered depending on the runtime arguments, not
+        // just the default one. The selector itself is only compared, never shown.
+        ast::Expression::Select { variants, .. } => {
+            for variant in variants {
+                harvest_pattern_chars(&variant.value, unique_chars);
+            }
+        }
+        ast::Expression::Inline(inline) => harvest_inline_chars(inline, unique_chars),
+    }
+}
+
+fn harvest_inline_chars(inline: &ast::InlineExpression<String>, unique_chars: &mut BTreeSet<char>) {
+    match inline {
+        // String literals may carry escapes (`{"\u00A0"}`); harvest what renders.
+        ast::InlineExpression::StringLiteral { value } => {
+            extend_visible(unique_chars, &unescape_unicode_to_string(value));
+        }
+        ast::InlineExpression::NumberLiteral { value } => extend_visible(unique_chars, value),
+        // Positional arguments may be echoed by custom functions. Named arguments
+        // are formatting options (`style: "percent"`) and never rendered.
+        ast::InlineExpression::FunctionReference { arguments, .. } => {
+            for argument in &arguments.positional {
+                harvest_inline_chars(argument, unique_chars);
+            }
+        }
+        ast::InlineExpression::Placeable { expression } => {
+            harvest_expression_chars(expression, unique_chars);
+        }
+        // References resolve to entries harvested on their own; variables are
+        // runtime data the charset cannot know about.
+        ast::InlineExpression::MessageReference { .. }
+        | ast::InlineExpression::TermReference { .. }
+        | ast::InlineExpression::VariableReference { .. } => {}
+    }
+}
+
+fn extend_visible(unique_chars: &mut BTreeSet<char>, text: &str) {
+    unique_chars.extend(text.chars().filter(|c| !c.is_control()));
+}
+
 /// Generates the static cache code for `fluent-zero`.
 pub fn generate_static_cache(locales_dir_path: &str) {
     FluentZeroBuilder::new(locales_dir_path).generate();
@@ -299,4 +371,98 @@ fn write_if_changed(path: &Path, contents: &str) -> std::io::Result<()> {
         return Ok(());
     }
     fs::write(path, contents)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Harvests the charset of an FTL source exactly as `generate` does.
+    fn charset(source: &str) -> String {
+        let ast = parser::parse(source.to_string()).expect("test FTL must parse");
+        let mut unique_chars = BTreeSet::new();
+        for entry in &ast.body {
+            match entry {
+                ast::Entry::Message(msg) => harvest_message_chars(msg, &mut unique_chars),
+                ast::Entry::Term(term) => harvest_term_chars(term, &mut unique_chars),
+                _ => {}
+            }
+        }
+        unique_chars.into_iter().collect()
+    }
+
+    fn assert_contains_all(charset: &str, expected: &str) {
+        for c in expected.chars() {
+            assert!(
+                charset.contains(c),
+                "{c:?} missing from charset {charset:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn harvests_plain_text() {
+        assert_eq!(charset("hello = Hi you\n"), " Hiouy");
+    }
+
+    #[test]
+    fn harvests_every_select_variant() {
+        let charset = charset("files = { $n ->\n    [one] Ёж\n   *[other] Щука\n}\n");
+        assert_contains_all(&charset, "ЁжЩука");
+    }
+
+    #[test]
+    fn harvests_nested_selects() {
+        let source = "\
+toggle = { $side ->
+    [left] { $shown ->
+        [true] ▶ 左
+       *[false] ◀ 左
+    }
+   *[right] 右侧
+}
+";
+        assert_contains_all(&charset(source), "▶◀左右侧");
+    }
+
+    #[test]
+    fn harvests_attributes() {
+        let charset = charset("login = Log in\n    .tooltip = Ẩn\n");
+        assert_contains_all(&charset, "Ẩ");
+    }
+
+    #[test]
+    fn harvests_message_with_only_attributes() {
+        let charset = charset("login =\n    .placeholder = 왼쪽\n");
+        assert_contains_all(&charset, "왼쪽");
+    }
+
+    #[test]
+    fn harvests_terms_and_their_attributes() {
+        let charset = charset("-brand = Ωmega\n    .short = Ж\n");
+        assert_contains_all(&charset, "ΩmegaЖ");
+    }
+
+    #[test]
+    fn harvests_unescaped_string_literals() {
+        let charset = charset("price = {\"\\u00A0\"}{\"€\"}\n");
+        assert_contains_all(&charset, "\u{a0}€");
+        assert!(!charset.contains('\\'), "escape syntax leaked: {charset:?}");
+    }
+
+    #[test]
+    fn harvests_number_literals() {
+        assert_contains_all(&charset("n = { 42 }\n"), "42");
+    }
+
+    #[test]
+    fn skips_identifiers_variables_and_named_options() {
+        let source = "\
+n = { NUMBER($count, style: \"percent\") ->
+    [one] a
+   *[other] b
+}
+";
+        assert_eq!(charset(source), "ab");
+    }
 }
