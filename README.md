@@ -68,7 +68,7 @@ fn main() {
 
 ### 4. Application Code
 
-In your `lib.rs` (or `main.rs`), you must include the generated file. This brings the `CACHE` and `LOCALES` statics (and the key list used for [compile-time key checking](#5-compile-time-key-checking)) into scope, which the `t!` macro relies on.
+In your `lib.rs` (or `main.rs`), you must include the generated file. This brings the `CATALOG` static (plus the plain `CACHE` and `LOCALES` maps, the `FALLBACK` locale and the key list used for [compile-time key checking](#7-compile-time-key-checking)) into scope, which the `t!` macro relies on.
 
 ```rust
 use fluent_zero::{t, set_lang};
@@ -104,7 +104,7 @@ fn main() {
 }
 ```
 
-Attributes (`.tooltip`, `.placeholder`, `.aria-label`, ...) are looked up with the conventional `message.attribute` key and follow the same fallback as message values: current language, then `en-US`, then the key itself. A message with only attributes (no value) works for its attributes:
+Attributes (`.tooltip`, `.placeholder`, `.aria-label`, ...) are looked up with the conventional `message.attribute` key and follow the same fallback as message values: the current language's negotiated fallback chain, then the fallback locale (`en-US` by default), then the key itself. `t_in!` resolves them the same way against its `LocaleState`. A message with only attributes (no value) works for its attributes:
 
 ```fluent
 login = Log in
@@ -113,11 +113,48 @@ search =
     .placeholder = Search
 ```
 
-### 5. Compile-Time Key Checking
+### 5. Locale Negotiation & Fallback
+
+`set_lang` resolves a fallback chain once, so lookups never parse or negotiate. The chain drops variants, script and region in turn (`sr-Latn-RS` → `sr-Latn` → `sr-RS` → `sr`), and the build step maps each language (and script-implying tags such as `zh-TW`) to the best locale **your crate** actually ships, using [`fluent-langneg`](https://crates.io/crates/fluent-langneg) with CLDR likely subtags. So with these directories:
+
+| `set_lang(...)`  | `en-US/`, `fr-FR/`, `pt-PT/`, `zh-Hant/` |
+| ---------------- | ---------------------------------------- |
+| `fr`, `fr-CA`    | `fr-FR`                                  |
+| `pt-BR`          | `pt-PT`                                  |
+| `zh-TW`, `zh-HK` | `zh-Hant`                                |
+| `de`             | the fallback locale (`en-US`)            |
+
+A message missing from the chosen locale comes from the fallback locale, then the key itself. The fallback defaults to `en-US`; change it in `build.rs` (the build fails if no such locale directory exists, so a typo cannot silently disable it):
+
+```rust
+fn main() {
+    fluent_zero_build::FluentZeroBuilder::new("assets/locales")
+        .fallback_locale("en-GB")
+        .generate();
+}
+```
+
+The generated code exports it as `FALLBACK`.
+
+### 6. Per-Call Locale (servers, multi-user tools)
+
+`t!` reads the global language. To render for several users at once, build a `LocaleState` per user (or request) and use `t_in!`, which bypasses the global language entirely:
+
+```rust
+use fluent_zero::{LocaleState, t_in};
+
+let lang = LocaleState::new("pt-BR".parse()?); // resolves the chain once
+let title = t_in!(&lang, "app-title");          // still zero-allocation
+let welcome = t_in!(&lang, "welcome-user", { "name" => "Alice" });
+```
+
+`lookup_static_in` and `lookup_dynamic_in` are the function equivalents.
+
+### 7. Compile-Time Key Checking
 
 A mistyped key never reaches your users as a raw key on screen; it fails the build.
 
-**String literals are checked by `t!`.** Every literal key is checked at compile time against the message IDs and `message.attribute` keys found in *any* locale, on stable Rust and without a proc-macro. Existing `t!("literal")` calls compile unchanged, and the check costs nothing at run time (it runs in a `const` item: a binary search over a sorted key list the build script generates).
+**String literals are checked by `t!` and `t_in!`.** Every literal key is checked at compile time against the message IDs and `message.attribute` keys found in *any* locale, on stable Rust and without a proc-macro. Existing `t!("literal")` and `t_in!(&lang, "literal")` calls compile unchanged, and the check costs nothing at run time (it runs in a `const` item: a binary search over a sorted key list the build script generates).
 
 ```rust
 let title = t!("app-titel");
@@ -126,7 +163,7 @@ let title = t!("app-titel");
 
 Only literals are checked: a key held in a variable or constant is looked up at run time as before. To pass a key that is deliberately missing from every locale, bind it to a variable first.
 
-**Every key is also a constant.** The generated code contains a `keys` module with one `pub const` per message ID and per attribute key (`login.tooltip` becomes `LOGIN_TOOLTIP`), documented with its source in the fallback locale (`en-US`), so your IDE can autocomplete keys and show the text on hover:
+**Every key is also a constant.** The generated code contains a `keys` module with one `pub const` per message ID and per attribute key (`login.tooltip` becomes `LOGIN_TOOLTIP`), documented with its source in the [fallback locale](#5-locale-negotiation--fallback) (`en-US` unless configured), so your IDE can autocomplete keys and show the text on hover:
 
 ```rust
 let title = t!(keys::APP_TITLE);
@@ -140,7 +177,7 @@ Constant names are derived deterministically:
 - A name that would not start with an ASCII letter is prefixed with `KEY_`.
 - If several IDs map to the same name (`foo-bar` and `foo_bar`), they are sorted by byte order: the first keeps the plain name and each later one gets `_2`, `_3`, ... (skipping any name that another ID maps to on its own), and the build prints a `cargo:warning` naming the constant it received.
 
-> **Note:** the generated file now defines a `keys` module and a hidden `__FLUENT_ZERO_KEYS` constant next to `CACHE` and `LOCALES`, so it cannot be included into a module that already has its own item named `keys`. Keep `fluent-zero` and `fluent-zero-build` on the same version: `t!` refers to the generated key list.
+> **Note:** the generated file now defines a `keys` module and a hidden `__FLUENT_ZERO_KEYS` constant next to `CATALOG`, `CACHE` and `LOCALES`, so it cannot be included into a module that already has its own item named `keys`. Keep `fluent-zero` and `fluent-zero-build` on the same version: `t!` and `t_in!` refer to the generated key list.
 
 ## 🩺 Diagnostics
 
@@ -157,7 +194,7 @@ set_error_handler(|error: &LookupError| match error {
 });
 ```
 
-`LookupError` covers a key found in neither the current nor the fallback language (`MissingKey`; for a `message.attribute` key this includes a message that lacks that attribute), a bare lookup of a message that has only attributes (`MissingValue`; look up `message.attribute` instead), and partial formatting such as a missing argument (`Format`, with the `fluent-bundle` errors). A key missing from the current language but found in `en-US` is not an error. `clear_error_handler()` removes the handler.
+`LookupError` covers a key found in neither the current nor the fallback language (`MissingKey`; for a `message.attribute` key this includes a message that lacks that attribute), a bare lookup of a message that has only attributes (`MissingValue`; look up `message.attribute` instead), and partial formatting such as a missing argument (`Format`, with the `fluent-bundle` errors). A key missing from the current language but found through its fallback chain or in the fallback locale is not an error. Misses through `t_in!`, `lookup_static_in` and `lookup_dynamic_in` are reported too, with the `LocaleState`'s language. `clear_error_handler()` removes the handler.
 
 Alternatively, enable the off-by-default `tracing` feature to log every `LookupError` with `tracing::warn!` (target `fluent_zero`):
 
@@ -178,7 +215,7 @@ assets/locales/en-US/main.ftl:2:8: Expected a token starting with "="
 
 ### Translation coverage
 
-The builder warns, once per locale, about message IDs present in `en-US` but missing from another locale (those fall back to `en-US` at runtime). Coverage is per message: attributes are not counted separately.
+The builder warns, once per locale, about message IDs present in the fallback locale (`en-US` unless configured with `.fallback_locale(...)`) but missing from another locale (those fall back to it at runtime). Coverage is per message: attributes are not counted separately.
 
 ```text
 warning: my-app@0.1.0: fr-FR is missing 12 of 40 messages from en-US: about, greeting, menu-file, menu-open, title and 7 more
@@ -198,7 +235,7 @@ FluentZeroBuilder::new("assets/locales")
 
 `fluent-zero` supports a modular architecture where libraries and dependencies manage their own translations independently, but share their end results with the caller.
 
-While the **translation data** is isolated per crate (compile-time), the **language selection** is global (runtime). When your application calls `fluent_zero::set_lang("fr-FR")`, all UI plugins, logging dependencies, and nested widgets will instantly switch contexts without manual propagation.
+While the **translation data** is isolated per crate (compile-time), the **language selection** is global (runtime). When your application calls `fluent_zero::set_lang("fr-FR")`, all UI plugins, logging dependencies, and nested widgets will instantly switch contexts without manual propagation. Each crate negotiates that language against its own locales and uses its own fallback locale, so a library shipping only `fr/` still answers `fr-FR`.
 
 ---
 

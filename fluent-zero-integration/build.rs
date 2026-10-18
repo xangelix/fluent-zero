@@ -3,11 +3,14 @@ use std::{env, fs, path::Path};
 use fluent_zero_build::{FluentZeroBuilder, MissingTranslations};
 
 fn main() {
-    // fr-FR is deliberately partial, so neither run warns about coverage.
+    // fr-FR, pt-PT and zh-Hant are deliberately partial, so neither run warns
+    // about coverage. The fallback is set explicitly (to its default) so the
+    // build exercises the check that its directory exists.
     //
     // The same locales without bidi isolation, kept under a second name for
     // `src/lib.rs` to include alongside the default output.
     FluentZeroBuilder::new("locales")
+        .fallback_locale("en-US")
         .use_isolating(false)
         .missing_translations(MissingTranslations::Allow)
         .generate();
@@ -20,6 +23,7 @@ fn main() {
     .expect("Failed to rename the non-isolating cache");
 
     FluentZeroBuilder::new("locales")
+        .fallback_locale("en-US")
         .missing_translations(MissingTranslations::Allow)
         .generate();
 }

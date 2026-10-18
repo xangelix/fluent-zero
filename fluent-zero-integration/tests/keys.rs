@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use fluent_zero::t;
 // `t!` resolves these through `crate::`, exactly as in a consumer that
 // includes the generated file at its root.
-use fluent_zero_integration::{__FLUENT_ZERO_KEYS, CACHE, LOCALES, keys};
+use fluent_zero_integration::{__FLUENT_ZERO_KEYS, CACHE, CATALOG, keys};
 
 #[test]
 fn constants_hold_their_message_ids() {

@@ -6,10 +6,11 @@ use std::{
 };
 
 use fluent_zero::{
-    FluentArgs, LookupError, clear_error_handler, lookup_dynamic, lookup_static, set_error_handler,
-    set_lang,
+    FluentArgs, LocaleState, LookupError, clear_error_handler, lookup_dynamic, lookup_dynamic_in,
+    lookup_static, set_error_handler, set_lang, t_in,
 };
-use fluent_zero_integration::{CACHE, LOCALES};
+// `t_in!` resolves these through `crate::`, as in a consumer crate.
+use fluent_zero_integration::{__FLUENT_ZERO_KEYS, CACHE, CATALOG, LOCALES};
 
 /// What the handler saw, as owned strings: `(variant, key, lang, display)`.
 static SEEN: Mutex<Vec<(&str, String, String, String)>> = Mutex::new(Vec::new());
@@ -186,4 +187,39 @@ fn cleared_handler_is_not_called() {
         "no-such-key"
     );
     assert_eq!(seen(), []);
+}
+
+#[test]
+fn per_call_misses_are_reported_with_the_per_call_language() {
+    let _guard = setup();
+    let lang = LocaleState::new("pt-BR".parse().unwrap());
+    // Deliberately missing everywhere, so bound to a variable: a literal
+    // would fail the compile-time key check of `t_in!`.
+    let missing = "no-such-key";
+    assert_eq!(t_in!(&lang, missing), "no-such-key");
+    let args = FluentArgs::new();
+    assert_eq!(
+        lookup_dynamic_in(&lang, &CATALOG, &CATALOG, "login.nope", &args),
+        "login.nope"
+    );
+    // Found through the chain or the fallback: not an error.
+    assert_eq!(t_in!(&lang, "plain"), "Olá");
+    assert_eq!(t_in!(&lang, "about"), "About Acme");
+    assert_eq!(
+        seen(),
+        [
+            (
+                "missing-key",
+                "no-such-key".to_string(),
+                "pt-BR".to_string(),
+                "missing message `no-such-key` (language pt-BR)".to_string()
+            ),
+            (
+                "missing-key",
+                "login.nope".to_string(),
+                "pt-BR".to_string(),
+                "missing attribute `login.nope` (language pt-BR)".to_string()
+            ),
+        ]
+    );
 }

@@ -1,6 +1,7 @@
 use fluent_zero::{CacheEntry, FluentArgs, set_lang, t};
-// `t!` resolves these through `crate::`, as in a consumer crate.
-use fluent_zero_integration::{__FLUENT_ZERO_KEYS, CACHE, LOCALES};
+// `t!` resolves `crate::CATALOG` and checks literal keys against
+// `crate::__FLUENT_ZERO_KEYS`, as in a consumer crate.
+use fluent_zero_integration::{__FLUENT_ZERO_KEYS, CACHE, CATALOG, LOCALES};
 
 /// Formats `key` (`message` or `message.attribute`) with the runtime bundle,
 /// bypassing the static cache.
