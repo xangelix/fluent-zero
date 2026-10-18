@@ -5,3 +5,8 @@
 #![allow(clippy::unreadable_literal)]
 
 include!(concat!(env!("OUT_DIR"), "/static_cache.rs"));
+
+/// The same locales generated with `.use_isolating(false)`.
+pub mod no_isolating {
+    include!(concat!(env!("OUT_DIR"), "/static_cache_no_isolating.rs"));
+}
