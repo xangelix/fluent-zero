@@ -1,9 +1,9 @@
 use std::borrow::Cow;
 
 use fluent_zero::{CacheEntry, LanguageIdentifier, get_lang, set_lang, t};
-// `t!` reads `crate::CACHE` and `crate::LOCALES`; importing them at the root
-// of this test crate is enough.
-use fluent_zero_integration::{CACHE, LOCALES, renamed};
+// `t!` reads `crate::CATALOG` and `crate::__FLUENT_ZERO_KEYS`; importing them
+// at the root of this test crate is enough.
+use fluent_zero_integration::{__FLUENT_ZERO_KEYS, CACHE, CATALOG, renamed};
 
 #[test]
 fn t_macro_and_locale_state_work_through_the_public_api() {
@@ -35,4 +35,7 @@ fn renamed_crate_output_matches_the_default_output() {
         Some(CacheEntry::Static(_))
     ));
     assert!(renamed::LOCALES.get("fr-FR").is_some());
+    assert_eq!(renamed::CATALOG.fallback(), CATALOG.fallback());
+    assert_eq!(renamed::__FLUENT_ZERO_KEYS, __FLUENT_ZERO_KEYS);
+    assert_eq!(renamed::keys::PLAIN, "plain");
 }

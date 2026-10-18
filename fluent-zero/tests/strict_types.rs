@@ -1,11 +1,16 @@
-use std::{borrow::Cow, collections::HashMap};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    sync::{Mutex, MutexGuard},
+};
 
 // Imports
 use fluent_zero::{
     __private::{
-        CacheStore, ConcurrentFluentBundle, FluentResource, lookup_dynamic, lookup_static,
+        CacheStore, ConcurrentFluentBundle, FluentResource, lookup_dynamic, lookup_dynamic_in,
+        lookup_static, lookup_static_in,
     },
-    CacheEntry, FluentArgs, LanguageIdentifier, set_lang,
+    CacheEntry, FluentArgs, LanguageIdentifier, LocaleState, set_lang,
 };
 
 // =========================================================================
@@ -102,10 +107,21 @@ emoji = { "😀" }
     }
 }
 
+// The current language is process-global and tests run in parallel, so every
+// test that sets it holds this lock for its whole body.
+static LANG_LOCK: Mutex<()> = Mutex::new(());
+
+fn lang_lock() -> MutexGuard<'static, ()> {
+    LANG_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 // --- TEST CASES ---
 
 #[test]
 fn t01_static_hit_returns_borrowed() {
+    let _lang = lang_lock();
     let mocks = MockLocales::new();
     set_lang("en-US".parse().unwrap());
 
@@ -119,6 +135,7 @@ fn t01_static_hit_returns_borrowed() {
 
 #[test]
 fn t02_static_miss_hits_bundle_via_dynamic_entry() {
+    let _lang = lang_lock();
     let mocks = MockLocales::new();
     set_lang("en-US".parse().unwrap());
 
@@ -131,6 +148,7 @@ fn t02_static_miss_hits_bundle_via_dynamic_entry() {
 
 #[test]
 fn t03_dynamic_lookup_always_returns_owned_if_args_used() {
+    let _lang = lang_lock();
     let mocks = MockLocales::new();
     set_lang("en-US".parse().unwrap());
 
@@ -144,6 +162,7 @@ fn t03_dynamic_lookup_always_returns_owned_if_args_used() {
 
 #[test]
 fn t04_fallback_static_returns_borrowed() {
+    let _lang = lang_lock();
     let mocks = MockLocales::new();
     set_lang("de-DE".parse().unwrap()); // Unknown language
 
@@ -156,6 +175,7 @@ fn t04_fallback_static_returns_borrowed() {
 
 #[test]
 fn t06_language_switch_updates_static_return() {
+    let _lang = lang_lock();
     let mocks = MockLocales::new();
 
     set_lang("en-US".parse().unwrap());
@@ -173,6 +193,7 @@ fn t06_language_switch_updates_static_return() {
 
 #[test]
 fn t08_verify_zero_copy_pointer_address() {
+    let _lang = lang_lock();
     // This test performs pointer arithmetic to guarantee that the string returned
     // by lookup_static is the exact same memory address as the string stored
     // in the mock cache (simulating the .rodata segment).
@@ -202,6 +223,38 @@ fn t08_verify_zero_copy_pointer_address() {
     } else {
         panic!("Expected Borrowed result");
     }
+}
+
+#[test]
+fn t10_per_call_locale_ignores_the_global_language() {
+    let mocks = MockLocales::new();
+    let fr = LocaleState::new("fr-FR".parse().unwrap());
+
+    let result = lookup_static_in(&fr, &mocks.bundles, &mocks.cache, "hello");
+    assert_eq!(result, "Bonjour le monde");
+    assert!(matches!(result, Cow::Borrowed(_)));
+
+    // Missing in fr-FR: falls back to en-US.
+    let mut args = FluentArgs::new();
+    args.set("name", "Alice");
+    let result = lookup_dynamic_in(&fr, &mocks.bundles, &mocks.cache, "welcome", &args);
+    assert_eq!(result, "Welcome Alice");
+}
+
+#[test]
+fn t11_fallback_chain_drops_variants_and_subtags() {
+    let mocks = MockLocales::new();
+
+    // `fr-FR-1996` has no table of its own; its chain reaches `fr-FR`.
+    let variant = LocaleState::new("fr-FR-1996".parse().unwrap());
+    assert_eq!(
+        variant.chain().collect::<Vec<_>>(),
+        ["fr-FR-1996", "fr-FR", "fr"]
+    );
+    assert_eq!(
+        lookup_static_in(&variant, &mocks.bundles, &mocks.cache, "hello"),
+        "Bonjour le monde"
+    );
 }
 
 #[test]

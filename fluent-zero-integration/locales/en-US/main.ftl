@@ -19,3 +19,9 @@ count = { $n ->
     [one] one file
    *[other] { $n } files
 }
+login = Log in
+    .tooltip = Sign in to { -brand }
+    .greeting = Welcome back, { $name }
+    .en-only = Only in English
+search =
+    .placeholder = Search { -brand }
