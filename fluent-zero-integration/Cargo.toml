@@ -11,3 +11,10 @@ fluent-zero = { path = "../fluent-zero" }
 
 [build-dependencies]
 fluent-zero-build = { path = "../fluent-zero-build" }
+
+[dev-dependencies]
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "lookup"
+harness = false
