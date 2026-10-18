@@ -111,7 +111,9 @@ impl From<LanguageIdentifier> for LocaleState {
 /// Uses `ArcSwap` to allow lock-free reads, which is critical for high-performance
 /// hot paths in GUI rendering loops.
 static CURRENT_LANG: LazyLock<ArcSwap<LocaleState>> = LazyLock::new(|| {
-    let id: LanguageIdentifier = DEFAULT_FALLBACK.parse().unwrap();
+    // `DEFAULT_FALLBACK` is a valid tag (see the unit test), so the default
+    // is unreachable; it only keeps a panic path out of the runtime.
+    let id: LanguageIdentifier = DEFAULT_FALLBACK.parse().unwrap_or_default();
     ArcSwap::from_pointee(LocaleState::new(id))
 });
 
@@ -486,6 +488,13 @@ mod tests {
 
     fn chain(tag: &str) -> Vec<String> {
         lang(tag).chain().map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn default_fallback_is_a_valid_tag() {
+        let id: LanguageIdentifier = DEFAULT_FALLBACK.parse().unwrap();
+        assert_eq!(id.to_string(), "en-US");
+        assert_eq!(get_lang().key, DEFAULT_FALLBACK);
     }
 
     #[test]
