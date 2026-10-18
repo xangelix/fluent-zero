@@ -1,13 +1,18 @@
-use fluent_zero::{CacheEntry, FluentArgs};
+use fluent_zero::{CacheEntry, FluentArgs, set_lang, t};
 use fluent_zero_integration::{CACHE, LOCALES};
 
-/// Formats `key` with the runtime bundle, bypassing the static cache.
+/// Formats `key` (`message` or `message.attribute`) with the runtime bundle,
+/// bypassing the static cache.
 fn format_with_bundle(lang: &str, key: &str, args: Option<&FluentArgs>) -> String {
     let bundle = &***LOCALES.get(lang).expect("locale bundle");
-    let pattern = bundle
-        .get_message(key)
-        .and_then(|msg| msg.value())
-        .expect("message value");
+    let pattern = match key.split_once('.') {
+        None => bundle.get_message(key).and_then(|msg| msg.value()),
+        Some((id, attribute)) => bundle
+            .get_message(id)
+            .and_then(|msg| msg.get_attribute(attribute))
+            .map(|attribute| attribute.value()),
+    }
+    .expect("message value");
     let mut errors = Vec::new();
     let value = bundle.format_pattern(pattern, args, &mut errors);
     assert!(errors.is_empty(), "{key}: {errors:?}");
@@ -74,4 +79,50 @@ fn messages_with_arguments_stay_dynamic() {
         format_with_bundle("en-US", "count", Some(&args)),
         "\u{2068}3\u{2069} files"
     );
+}
+
+#[test]
+fn attributes_are_cached_under_dotted_keys() {
+    assert_eq!(
+        entry("en-US", "login.tooltip"),
+        CacheEntry::Static("Sign in to Acme")
+    );
+    assert_eq!(
+        entry("en-US", "search.placeholder"),
+        CacheEntry::Static("Search Acme")
+    );
+    assert_eq!(entry("en-US", "login.greeting"), CacheEntry::Dynamic);
+    assert_eq!(
+        entry("fr-FR", "login.tooltip"),
+        CacheEntry::Static("Se connecter")
+    );
+    assert!(CACHE["fr-FR"].get("login.en-only").is_none());
+}
+
+/// The only test that touches the global language, so parallel tests never
+/// observe each other's `set_lang`.
+#[test]
+fn attribute_lookups_through_t_macro() {
+    set_lang("en-US".parse().unwrap());
+    assert_eq!(t!("login"), "Log in");
+    assert_eq!(t!("login.tooltip"), "Sign in to Acme");
+    assert_eq!(t!("search.placeholder"), "Search Acme");
+    assert_eq!(
+        t!("login.greeting", { "name" => "Bob" }),
+        "Welcome back, \u{2068}Bob\u{2069}"
+    );
+
+    set_lang("fr-FR".parse().unwrap());
+    assert_eq!(t!("login.tooltip"), "Se connecter");
+    // Missing in fr-FR: falls back to en-US, exactly like message values.
+    assert_eq!(t!("login.en-only"), "Only in English");
+    assert_eq!(
+        t!("login.greeting", { "name" => "Bob" }),
+        "Welcome back, \u{2068}Bob\u{2069}"
+    );
+    // Missing everywhere: the key itself.
+    assert_eq!(t!("login.nope"), "login.nope");
+    assert_eq!(t!("nope.tooltip"), "nope.tooltip");
+
+    set_lang("en-US".parse().unwrap());
 }

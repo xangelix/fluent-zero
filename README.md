@@ -94,9 +94,23 @@ fn main() {
         "unread_count" => 5
     });
 
+    // CASE C: Attributes, addressed as `message.attribute`
+    // Static attributes are zero-allocation too; arguments work as in CASE B.
+    let tooltip = t!("login.tooltip");
+
     println!("{}", title);
     println!("{}", welcome);
+    println!("{}", tooltip);
 }
+```
+
+Attributes (`.tooltip`, `.placeholder`, `.aria-label`, ...) are looked up with the conventional `message.attribute` key and follow the same fallback as message values: current language, then `en-US`, then the key itself. A message with only attributes (no value) works for its attributes:
+
+```fluent
+login = Log in
+    .tooltip = Sign in to your account
+search =
+    .placeholder = Search
 ```
 
 ## 📦 Library Support & Nested Translations
