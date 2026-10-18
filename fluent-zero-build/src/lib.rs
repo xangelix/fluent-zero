@@ -1046,11 +1046,11 @@ via = Says { v }
         assert_eq!(
             const_names(&["login", "login.tooltip", "search.aria-label"]),
             [
-                ("LOGIN".to_string(), "login".to_string()),
-                ("LOGIN_TOOLTIP".to_string(), "login.tooltip".to_string()),
+                ("login".to_string(), "LOGIN".to_string()),
+                ("login.tooltip".to_string(), "LOGIN_TOOLTIP".to_string()),
                 (
-                    "SEARCH_ARIA_LABEL".to_string(),
-                    "search.aria-label".to_string()
+                    "search.aria-label".to_string(),
+                    "SEARCH_ARIA_LABEL".to_string()
                 ),
             ]
         );
