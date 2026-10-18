@@ -94,9 +94,23 @@ fn main() {
         "unread_count" => 5
     });
 
+    // CASE C: Attributes, addressed as `message.attribute`
+    // Static attributes are zero-allocation too; arguments work as in CASE B.
+    let tooltip = t!("login.tooltip");
+
     println!("{}", title);
     println!("{}", welcome);
+    println!("{}", tooltip);
 }
+```
+
+Attributes (`.tooltip`, `.placeholder`, `.aria-label`, ...) are looked up with the conventional `message.attribute` key and follow the same fallback as message values: current language, then `en-US`, then the key itself. A message with only attributes (no value) works for its attributes:
+
+```fluent
+login = Log in
+    .tooltip = Sign in to your account
+search =
+    .placeholder = Search
 ```
 
 ## 🩺 Diagnostics
@@ -114,7 +128,7 @@ set_error_handler(|error: &LookupError| match error {
 });
 ```
 
-`LookupError` covers a key found in neither the current nor the fallback language (`MissingKey`), a message with attributes but no value (`MissingValue`), and partial formatting such as a missing argument (`Format`, with the `fluent-bundle` errors). A key missing from the current language but found in `en-US` is not an error. `clear_error_handler()` removes the handler.
+`LookupError` covers a key found in neither the current nor the fallback language (`MissingKey`; for a `message.attribute` key this includes a message that lacks that attribute), a bare lookup of a message that has only attributes (`MissingValue`; look up `message.attribute` instead), and partial formatting such as a missing argument (`Format`, with the `fluent-bundle` errors). A key missing from the current language but found in `en-US` is not an error. `clear_error_handler()` removes the handler.
 
 Alternatively, enable the off-by-default `tracing` feature to log every `LookupError` with `tracing::warn!` (target `fluent_zero`):
 
@@ -135,7 +149,7 @@ assets/locales/en-US/main.ftl:2:8: Expected a token starting with "="
 
 ### Translation coverage
 
-The builder warns, once per locale, about message IDs present in `en-US` but missing from another locale (those fall back to `en-US` at runtime):
+The builder warns, once per locale, about message IDs present in `en-US` but missing from another locale (those fall back to `en-US` at runtime). Coverage is per message: attributes are not counted separately.
 
 ```text
 warning: my-app@0.1.0: fr-FR is missing 12 of 40 messages from en-US: about, greeting, menu-file, menu-open, title and 7 more

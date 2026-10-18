@@ -110,6 +110,13 @@ fn missing_argument_is_reported_and_still_renders() {
 #[test]
 fn message_without_value_is_reported_then_missing() {
     let _guard = setup();
+    // The attribute of an attribute-only message is a normal lookup...
+    assert_eq!(
+        lookup_static(&LOCALES, &CACHE, "attributes-only.title"),
+        "Title"
+    );
+    assert_eq!(seen(), []);
+    // ...but the bare ID has no value to render.
     assert_eq!(
         lookup_static(&LOCALES, &CACHE, "attributes-only"),
         "attributes-only"
@@ -121,6 +128,52 @@ fn message_without_value_is_reported_then_missing() {
             ("missing-value", "attributes-only".into(), "en-US".into()),
             ("missing-key", "attributes-only".into(), "en-US".into()),
         ]
+    );
+}
+
+#[test]
+fn attribute_fallback_reports_nothing() {
+    let _guard = setup();
+    set_lang("fr-FR".parse().unwrap());
+    assert_eq!(
+        lookup_static(&LOCALES, &CACHE, "login.tooltip"),
+        "Se connecter"
+    );
+    assert_eq!(
+        lookup_static(&LOCALES, &CACHE, "login.en-only"),
+        "Only in English"
+    );
+    assert_eq!(seen(), []);
+}
+
+#[test]
+fn missing_attribute_is_reported_as_an_attribute() {
+    let _guard = setup();
+    set_lang("fr-FR".parse().unwrap());
+    // The message exists in both languages, the attribute in neither.
+    assert_eq!(lookup_static(&LOCALES, &CACHE, "login.nope"), "login.nope");
+    assert_eq!(
+        seen(),
+        [(
+            "missing-key",
+            "login.nope".to_string(),
+            "fr-FR".to_string(),
+            "missing attribute `login.nope` (language fr-FR)".to_string()
+        )]
+    );
+}
+
+#[test]
+fn missing_attribute_argument_is_reported_with_the_attribute_key() {
+    let _guard = setup();
+    assert_eq!(
+        lookup_static(&LOCALES, &CACHE, "login.greeting"),
+        "Welcome back, \u{2068}{$name}\u{2069}"
+    );
+    let variants: Vec<_> = seen().into_iter().map(|(v, k, l, _)| (v, k, l)).collect();
+    assert_eq!(
+        variants,
+        [("format", "login.greeting".into(), "en-US".into())]
     );
 }
 
