@@ -68,7 +68,7 @@ fn main() {
 
 For more control, use the builder. `try_generate()` returns a
 `Result<(), fluent_zero_build::Error>` (missing `OUT_DIR`, unreadable files, FTL
-syntax errors) instead of panicking like `generate()`:
+syntax errors, duplicate message IDs) instead of panicking like `generate()`:
 
 ```rust
 fn main() -> Result<(), Box<dyn std::error::Error>> {
