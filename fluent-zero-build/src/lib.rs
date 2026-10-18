@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     env, fs,
     io::Write as _,
     path::{Path, PathBuf},
@@ -258,8 +258,9 @@ impl FluentZeroBuilder {
     ) {
         writeln!(
             file,
-            "\n/// Every message ID found in any locale, as a constant. Using these\n\
-             /// instead of string literals turns a mistyped key into a compile error.\n\
+            "\n/// Every message ID and `message.attribute` key found in any locale, as a\n\
+             /// constant. Using these instead of string literals turns a mistyped key\n\
+             /// into a compile error.\n\
              pub mod keys {{"
         )
         .unwrap();
@@ -269,13 +270,19 @@ impl FluentZeroBuilder {
                     "cargo:warning=fluent-zero: message ID `{key}` clashes with another ID's constant name; it is available as `keys::{name}`"
                 );
             }
+            // Fluent IDs cannot contain `.`, so a dotted key is an attribute.
+            let kind = if key.contains('.') {
+                "Attribute"
+            } else {
+                "Message"
+            };
             let doc = match fallback_sources.get(key) {
                 Some(source) => format!(
-                    "Message `{key}`. Fallback locale (`{FALLBACK_LOCALE}`) text:\n\n{}",
+                    "{kind} `{key}`. Fallback locale (`{FALLBACK_LOCALE}`) text:\n\n{}",
                     fenced_text(source)
                 ),
                 None => format!(
-                    "Message `{key}`. Not defined in the fallback locale (`{FALLBACK_LOCALE}`)."
+                    "{kind} `{key}`. Not defined in the fallback locale (`{FALLBACK_LOCALE}`)."
                 ),
             };
             writeln!(
@@ -387,7 +394,12 @@ fn entry_definitions(source: &str) -> impl Iterator<Item = (&str, usize)> {
     })
 }
 
-/// Builds the `(message id, CacheEntry expression)` pairs for one locale.
+/// Builds the `(key, CacheEntry expression)` pairs for one locale.
+///
+/// Every message gets an entry under its id, and every attribute an entry
+/// under `"message.attribute"` (Fluent ids cannot contain `.`, so the keys
+/// never collide). Attributes are classified and formatted exactly like
+/// values, so a message with only attributes still gets static attributes.
 ///
 /// A message is static when its output cannot depend on runtime arguments:
 /// only text, string/number literals, and references to other static
@@ -410,24 +422,50 @@ fn static_cache_entries(lang_id: &LanguageIdentifier, source: &str) -> Vec<(Stri
         let ast::Entry::Message(msg) = entry else {
             continue;
         };
+        let id = msg.id.name;
         let static_value = msg
             .value
             .as_ref()
-            .filter(|_| analysis.message(msg.id.name, None))
-            .and_then(|pattern| {
-                let mut errors = Vec::new();
-                let value = bundle.format_pattern(pattern, None, &mut errors);
-                errors.is_empty().then(|| value.into_owned())
-            });
-        let cache_entry = match static_value {
-            // `{:?}` on a `str` is a valid Rust string literal: quotes,
-            // backslashes and invisible characters are all escaped.
-            Some(value) => format!("::fluent_zero::CacheEntry::Static({value:?})"),
-            None => "::fluent_zero::CacheEntry::Dynamic".to_string(),
-        };
-        entries.push((msg.id.name.to_string(), cache_entry));
+            .filter(|_| analysis.message(id, None))
+            .and_then(|pattern| format_static(&bundle, pattern));
+        entries.push((id.to_string(), cache_entry(static_value)));
+
+        let mut seen = HashSet::new();
+        for attribute in &msg.attributes {
+            let name = attribute.id.name;
+            // The runtime resolves a repeated attribute name to its first
+            // definition; emit only that one (a duplicate PHF key would panic).
+            if !seen.insert(name) {
+                continue;
+            }
+            let static_value = analysis
+                .message(id, Some(name))
+                .then(|| format_static(&bundle, &attribute.value))
+                .flatten();
+            entries.push((format!("{id}.{name}"), cache_entry(static_value)));
+        }
     }
     entries
+}
+
+/// Formats a pattern the analysis proved static, or `None` if it does not
+/// format cleanly (it then stays dynamic).
+fn format_static<'r>(
+    bundle: &FluentBundle<&'r FluentResource>,
+    pattern: &'r ast::Pattern<&'r str>,
+) -> Option<String> {
+    let mut errors = Vec::new();
+    let value = bundle.format_pattern(pattern, None, &mut errors);
+    errors.is_empty().then(|| value.into_owned())
+}
+
+fn cache_entry(static_value: Option<String>) -> String {
+    match static_value {
+        // `{:?}` on a `str` is a valid Rust string literal: quotes,
+        // backslashes and invisible characters are all escaped.
+        Some(value) => format!("::fluent_zero::CacheEntry::Static({value:?})"),
+        None => "::fluent_zero::CacheEntry::Dynamic".to_string(),
+    }
 }
 
 /// Decides which messages and terms render the same text for any arguments.
@@ -539,21 +577,41 @@ impl<'r> StaticAnalysis<'r> {
 }
 
 /// The FTL source of every message in `source` (value and attributes, without
-/// comments), normalised by the `fluent-syntax` serializer. The first
-/// definition of an ID wins, as it does in the runtime bundle.
+/// comments), normalised by the `fluent-syntax` serializer, keyed by message
+/// ID; plus, under each `"message.attribute"` key, the message reduced to just
+/// that attribute. The first definition of an ID or attribute wins, as it does
+/// in the runtime bundle.
 fn message_sources(source: &str) -> HashMap<String, String> {
+    fn serialize(msg: ast::Message<&str>) -> String {
+        let resource = ast::Resource {
+            body: vec![ast::Entry::Message(msg)],
+        };
+        serializer::serialize(&resource).trim_end().to_string()
+    }
+
     let resource = FluentResource::try_new(source.to_owned()).unwrap_or_else(|(res, _)| res);
     let mut sources = HashMap::new();
     for entry in resource.entries() {
         if let ast::Entry::Message(msg) = entry {
-            sources.entry(msg.id.name.to_string()).or_insert_with(|| {
-                let mut msg = msg.clone();
-                msg.comment = None;
-                let resource = ast::Resource {
-                    body: vec![ast::Entry::Message(msg)],
-                };
-                serializer::serialize(&resource).trim_end().to_string()
-            });
+            let id = msg.id.name;
+            if sources.contains_key(id) {
+                continue;
+            }
+            for attribute in &msg.attributes {
+                sources
+                    .entry(format!("{id}.{}", attribute.id.name))
+                    .or_insert_with(|| {
+                        serialize(ast::Message {
+                            id: msg.id.clone(),
+                            value: None,
+                            attributes: vec![attribute.clone()],
+                            comment: None,
+                        })
+                    });
+            }
+            let mut msg = msg.clone();
+            msg.comment = None;
+            sources.insert(id.to_string(), serialize(msg));
         }
     }
     sources
@@ -970,9 +1028,73 @@ via = Says { v }
     }
 
     #[test]
+    fn message_sources_document_each_attribute_on_its_own() {
+        let sources = message_sources(
+            "login = Log in\n    .tooltip = Hi\n    .label = Go\n    .tooltip = Dup\nsearch =\n    .placeholder = Find\n",
+        );
+        assert_eq!(sources["login.tooltip"], "login =\n    .tooltip = Hi");
+        assert_eq!(sources["login.label"], "login =\n    .label = Go");
+        assert_eq!(
+            sources["search.placeholder"],
+            "search =\n    .placeholder = Find"
+        );
+        assert!(sources.contains_key("search"));
+    }
+
+    #[test]
+    fn attribute_keys_get_constants() {
+        assert_eq!(
+            const_names(&["login", "login.tooltip", "search.aria-label"]),
+            [
+                ("LOGIN".to_string(), "login".to_string()),
+                ("LOGIN_TOOLTIP".to_string(), "login.tooltip".to_string()),
+                (
+                    "SEARCH_ARIA_LABEL".to_string(),
+                    "search.aria-label".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
     fn fenced_text_outlasts_backtick_runs() {
         assert_eq!(fenced_text("a = b"), "```text\na = b\n```");
         assert_eq!(fenced_text("a = ````"), "`````text\na = ````\n`````");
+    }
+
+    #[test]
+    fn attributes_get_dotted_keys_and_static_values() {
+        let source = "\
+-brand = Acme
+login = Log in
+    .tooltip = Sign in to { -brand }
+    .aria = { login }
+    .hint = Hi { $name }
+";
+        let entries = entries(source);
+        assert_eq!(entries["login"], static_literal("Log in"));
+        assert_eq!(entries["login.tooltip"], static_literal("Sign in to Acme"));
+        assert_eq!(entries["login.aria"], static_literal("Log in"));
+        assert_eq!(entries["login.hint"], DYNAMIC);
+    }
+
+    #[test]
+    fn attribute_only_messages_get_attribute_entries() {
+        let entries =
+            entries("field =\n    .placeholder = Name\n    .label = { field.placeholder }:\n");
+        // The bare id has no value; the runtime falls through it as before.
+        assert_eq!(entries["field"], DYNAMIC);
+        assert_eq!(entries["field.placeholder"], static_literal("Name"));
+        assert_eq!(entries["field.label"], static_literal("Name:"));
+    }
+
+    #[test]
+    fn repeated_attribute_names_keep_the_first() {
+        let source = "m = M\n    .a = First\n    .a = Second\n";
+        let generated = static_cache_entries(&"en-US".parse().unwrap(), source);
+        let keys: Vec<&str> = generated.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["m", "m.a"]);
+        assert_eq!(generated[1].1, static_literal("First"));
     }
 
     #[test]

@@ -94,16 +94,30 @@ fn main() {
         "unread_count" => 5
     });
 
+    // CASE C: Attributes, addressed as `message.attribute`
+    // Static attributes are zero-allocation too; arguments work as in CASE B.
+    let tooltip = t!("login.tooltip");
+
     println!("{}", title);
     println!("{}", welcome);
+    println!("{}", tooltip);
 }
+```
+
+Attributes (`.tooltip`, `.placeholder`, `.aria-label`, ...) are looked up with the conventional `message.attribute` key and follow the same fallback as message values: current language, then `en-US`, then the key itself. A message with only attributes (no value) works for its attributes:
+
+```fluent
+login = Log in
+    .tooltip = Sign in to your account
+search =
+    .placeholder = Search
 ```
 
 ### 5. Compile-Time Key Checking
 
 A mistyped key never reaches your users as a raw key on screen; it fails the build.
 
-**String literals are checked by `t!`.** Every literal key is checked at compile time against the message IDs found in *any* locale, on stable Rust and without a proc-macro. Existing `t!("literal")` calls compile unchanged, and the check costs nothing at run time (it runs in a `const` item: a binary search over a sorted key list the build script generates).
+**String literals are checked by `t!`.** Every literal key is checked at compile time against the message IDs and `message.attribute` keys found in *any* locale, on stable Rust and without a proc-macro. Existing `t!("literal")` calls compile unchanged, and the check costs nothing at run time (it runs in a `const` item: a binary search over a sorted key list the build script generates).
 
 ```rust
 let title = t!("app-titel");
@@ -112,11 +126,12 @@ let title = t!("app-titel");
 
 Only literals are checked: a key held in a variable or constant is looked up at run time as before. To pass a key that is deliberately missing from every locale, bind it to a variable first.
 
-**Every message ID is also a constant.** The generated code contains a `keys` module with one `pub const` per message ID, documented with its source in the fallback locale (`en-US`), so your IDE can autocomplete keys and show the text on hover:
+**Every key is also a constant.** The generated code contains a `keys` module with one `pub const` per message ID and per attribute key (`login.tooltip` becomes `LOGIN_TOOLTIP`), documented with its source in the fallback locale (`en-US`), so your IDE can autocomplete keys and show the text on hover:
 
 ```rust
 let title = t!(keys::APP_TITLE);
 let welcome = t!(keys::WELCOME_USER, { "name" => "Alice" });
+let tooltip = t!(keys::LOGIN_TOOLTIP);
 ```
 
 Constant names are derived deterministically:

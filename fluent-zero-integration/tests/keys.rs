@@ -57,3 +57,25 @@ fn key_list_is_the_sorted_union_of_every_locale() {
         );
     }
 }
+
+#[test]
+fn attribute_keys_pass_the_literal_check() {
+    // Each of these literals is validated in a `const` item: a build that
+    // rejected `message.attribute` keys would fail to compile this test.
+    assert_eq!(t!("login.tooltip"), "Sign in to Acme");
+    assert_eq!(t!("search.placeholder"), "Search Acme");
+    assert_eq!(
+        t!("login.greeting", { "name" => "Bob" }),
+        "Welcome back, \u{2068}Bob\u{2069}"
+    );
+    assert!(__FLUENT_ZERO_KEYS.contains(&"login.tooltip"));
+}
+
+#[test]
+fn attribute_keys_get_constants() {
+    assert_eq!(keys::LOGIN, "login");
+    assert_eq!(keys::LOGIN_TOOLTIP, "login.tooltip");
+    assert_eq!(keys::LOGIN_EN_ONLY, "login.en-only");
+    assert_eq!(keys::SEARCH_PLACEHOLDER, "search.placeholder");
+    assert_eq!(t!(keys::LOGIN_TOOLTIP), "Sign in to Acme");
+}
