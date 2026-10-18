@@ -6,8 +6,12 @@ use std::{
 };
 
 use fluent_bundle::{FluentBundle, FluentResource};
-use fluent_syntax::{ast, parser, unicode::unescape_unicode_to_string};
+use fluent_syntax::{ast, parser, serializer, unicode::unescape_unicode_to_string};
 use unic_langid::LanguageIdentifier;
+
+/// The locale the runtime falls back to; its text documents the generated
+/// key constants.
+const FALLBACK_LOCALE: &str = "en-US";
 
 /// A builder to configure and generate the static cache code for `fluent-zero`.
 pub struct FluentZeroBuilder {
@@ -79,6 +83,8 @@ impl FluentZeroBuilder {
 
         let mut bundle_entries: Vec<(String, String)> = Vec::new();
         let mut cache_root_entries: Vec<(String, String)> = Vec::new();
+        let mut all_keys: BTreeSet<String> = BTreeSet::new();
+        let mut fallback_sources: HashMap<String, String> = HashMap::new();
 
         // 2. Process Local Translations (If present)
         if self.locales_dir.exists() {
@@ -109,6 +115,10 @@ impl FluentZeroBuilder {
 
                 let combined_ftl_source = Self::process_locale_dir(&path, &mut unique_chars);
                 let cache_entries = static_cache_entries(&lang_id, &combined_ftl_source);
+                all_keys.extend(cache_entries.iter().map(|(key, _)| key.clone()));
+                if lang_key == FALLBACK_LOCALE {
+                    fallback_sources = message_sources(&combined_ftl_source);
+                }
 
                 Self::write_bundle_initializer(
                     &mut file,
@@ -126,6 +136,7 @@ impl FluentZeroBuilder {
         // 3. Complete Code Generation & Upstream Exporting
         // This unconditionally runs to guarantee valid empty PHF maps in aggregator crates.
         Self::write_root_maps(&mut file, &cache_root_entries, &bundle_entries);
+        Self::write_keys(&mut file, &all_keys, &fallback_sources);
         self.export_charset_data(&mut file, &unique_chars, &out_dir);
     }
 
@@ -220,6 +231,55 @@ impl FluentZeroBuilder {
             "pub static LOCALES: ::fluent_zero::phf::Map<&'static str, &'static std::sync::LazyLock<::fluent_zero::ConcurrentFluentBundle<::fluent_zero::FluentResource>>> = {};",
             bundle_map.build()
         ).unwrap();
+    }
+
+    /// Writes `pub mod keys` (one constant per message ID) and the sorted
+    /// key list `t!` checks string literal keys against at compile time.
+    fn write_keys(
+        file: &mut fs::File,
+        all_keys: &BTreeSet<String>,
+        fallback_sources: &HashMap<String, String>,
+    ) {
+        writeln!(
+            file,
+            "\n/// Every message ID found in any locale, as a constant. Using these\n\
+             /// instead of string literals turns a mistyped key into a compile error.\n\
+             pub mod keys {{"
+        )
+        .unwrap();
+        for (name, key) in key_const_names(all_keys) {
+            if name != key_const_base(key) {
+                println!(
+                    "cargo:warning=fluent-zero: message ID `{key}` clashes with another ID's constant name; it is available as `keys::{name}`"
+                );
+            }
+            let doc = match fallback_sources.get(key) {
+                Some(source) => format!(
+                    "Message `{key}`. Fallback locale (`{FALLBACK_LOCALE}`) text:\n\n{}",
+                    fenced_text(source)
+                ),
+                None => format!(
+                    "Message `{key}`. Not defined in the fallback locale (`{FALLBACK_LOCALE}`)."
+                ),
+            };
+            writeln!(
+                file,
+                "    #[doc = {doc:?}]\n    pub const {name}: &str = {key:?};"
+            )
+            .unwrap();
+        }
+        writeln!(file, "}}").unwrap();
+
+        // `t!` binary-searches this list in a `const` item, so it must stay
+        // sorted by byte order: `BTreeSet<String>` iterates in exactly `str`'s `Ord`.
+        let sorted: Vec<&String> = all_keys.iter().collect();
+        writeln!(
+            file,
+            "\n/// Sorted message IDs; `t!` validates string literal keys against it.\n\
+             #[doc(hidden)]\n\
+             pub const __FLUENT_ZERO_KEYS: &[&str] = &{sorted:?};"
+        )
+        .unwrap();
     }
 
     fn export_charset_data(
@@ -407,6 +467,94 @@ impl<'r> StaticAnalysis<'r> {
             | ast::InlineExpression::VariableReference { .. } => false,
         }
     }
+}
+
+/// The FTL source of every message in `source` (value and attributes, without
+/// comments), normalised by the `fluent-syntax` serializer. The first
+/// definition of an ID wins, as it does in the runtime bundle.
+fn message_sources(source: &str) -> HashMap<String, String> {
+    let resource = FluentResource::try_new(source.to_owned()).unwrap_or_else(|(res, _)| res);
+    let mut sources = HashMap::new();
+    for entry in resource.entries() {
+        if let ast::Entry::Message(msg) = entry {
+            sources.entry(msg.id.name.to_string()).or_insert_with(|| {
+                let mut msg = msg.clone();
+                msg.comment = None;
+                let resource = ast::Resource {
+                    body: vec![ast::Entry::Message(msg)],
+                };
+                serializer::serialize(&resource).trim_end().to_string()
+            });
+        }
+    }
+    sources
+}
+
+/// Wraps `text` in a fenced `text` code block, so rustdoc neither renders it
+/// as Markdown nor runs it as a doctest. The fence is longer than any run of
+/// backticks inside `text`.
+fn fenced_text(text: &str) -> String {
+    let mut longest = 0;
+    let mut run = 0;
+    for c in text.chars() {
+        run = if c == '`' { run + 1 } else { 0 };
+        longest = longest.max(run);
+    }
+    let fence = "`".repeat(longest.max(2) + 1);
+    format!("{fence}text\n{text}\n{fence}")
+}
+
+/// The constant name a key gets when nothing clashes with it: ASCII letters
+/// are uppercased, ASCII digits kept, and every other character (`-`, `.`,
+/// `_`, anything non-ASCII) becomes `_`. A name that would not start with an
+/// ASCII letter is prefixed with `KEY_`. The result is always a valid Rust
+/// identifier, and never a keyword (keywords are not all uppercase).
+fn key_const_base(key: &str) -> String {
+    let name: String = key
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if name.starts_with(|c: char| c.is_ascii_alphabetic()) {
+        name
+    } else {
+        format!("KEY_{name}")
+    }
+}
+
+/// Assigns every key a unique constant name, deterministically.
+///
+/// Keys are visited in byte order. The first key to want a base name (see
+/// [`key_const_base`]) gets it; each later key wanting the same name (e.g.
+/// `foo_bar` after `foo-bar`) gets `{BASE}_{n}` with the smallest `n >= 2`
+/// that is neither another key's base name nor already assigned, so a
+/// suffixed name never takes the plain name of a different key.
+fn key_const_names(keys: &BTreeSet<String>) -> Vec<(String, &str)> {
+    let bases: BTreeSet<String> = keys.iter().map(|key| key_const_base(key)).collect();
+    let mut assigned: BTreeSet<String> = BTreeSet::new();
+    let mut names = Vec::with_capacity(keys.len());
+    for key in keys {
+        let base = key_const_base(key);
+        let mut name = base.clone();
+        if assigned.contains(&name) {
+            let mut n = 2;
+            loop {
+                name = format!("{base}_{n}");
+                if !bases.contains(&name) && !assigned.contains(&name) {
+                    break;
+                }
+                n += 1;
+            }
+        }
+        assigned.insert(name.clone());
+        names.push((name, key.as_str()));
+    }
+    names
 }
 
 fn attribute_value<'r>(
@@ -649,6 +797,72 @@ via = Says { v }
         for id in ["missing", "x", "y", "attrs"] {
             assert_eq!(entries[id], DYNAMIC, "{id} should be dynamic");
         }
+    }
+
+    fn const_names(keys: &[&str]) -> Vec<(String, String)> {
+        let keys: BTreeSet<String> = keys.iter().map(ToString::to_string).collect();
+        key_const_names(&keys)
+            .into_iter()
+            .map(|(name, key)| (key.to_string(), name))
+            .collect()
+    }
+
+    #[test]
+    fn key_constants_are_screaming_snake_case() {
+        assert_eq!(key_const_base("app-title"), "APP_TITLE");
+        assert_eq!(key_const_base("btn_submit"), "BTN_SUBMIT");
+        assert_eq!(key_const_base("menuTitle2"), "MENUTITLE2");
+        assert_eq!(key_const_base("login.tooltip"), "LOGIN_TOOLTIP");
+    }
+
+    #[test]
+    fn key_constants_are_always_valid_identifiers() {
+        assert_eq!(key_const_base("1st"), "KEY_1ST");
+        assert_eq!(key_const_base("-x"), "KEY__X");
+        assert_eq!(key_const_base(""), "KEY_");
+        assert_eq!(key_const_base("héllo"), "H_LLO");
+    }
+
+    #[test]
+    fn colliding_keys_get_deterministic_suffixes() {
+        // Byte order: "a-b" < "aB" < "a_b"; the first takes the plain name.
+        assert_eq!(
+            const_names(&["a_b", "aB", "a-b"]),
+            [
+                ("a-b".to_string(), "A_B".to_string()),
+                ("aB".to_string(), "AB".to_string()),
+                ("a_b".to_string(), "A_B_2".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn suffixes_never_take_another_keys_plain_name() {
+        // `a_b-2` owns `A_B_2`, so the clash between `a-b` and `a_b` moves on to `_3`.
+        let names = const_names(&["a-b", "a_b", "a_b-2"]);
+        assert_eq!(
+            names,
+            [
+                ("a-b".to_string(), "A_B".to_string()),
+                ("a_b".to_string(), "A_B_3".to_string()),
+                ("a_b-2".to_string(), "A_B_2".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn message_sources_document_value_and_attributes_without_comments() {
+        let sources = message_sources("# note\nlogin = Log in\n    .tooltip = Hi { $name }\n");
+        assert_eq!(
+            sources["login"],
+            "login = Log in\n    .tooltip = Hi { $name }"
+        );
+    }
+
+    #[test]
+    fn fenced_text_outlasts_backtick_runs() {
+        assert_eq!(fenced_text("a = b"), "```text\na = b\n```");
+        assert_eq!(fenced_text("a = ````"), "`````text\na = ````\n`````");
     }
 
     #[test]
