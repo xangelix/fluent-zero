@@ -68,7 +68,7 @@ fn main() {
 
 ### 4. Application Code
 
-In your `lib.rs` (or `main.rs`), you must include the generated file. This brings the `CACHE` and `LOCALES` statics into scope, which the `t!` macro relies on.
+In your `lib.rs` (or `main.rs`), you must include the generated file. This brings the `CACHE` and `LOCALES` statics (and the key list used for [compile-time key checking](#5-compile-time-key-checking)) into scope, which the `t!` macro relies on.
 
 ```rust
 use fluent_zero::{t, set_lang};
@@ -112,6 +112,35 @@ login = Log in
 search =
     .placeholder = Search
 ```
+
+### 5. Compile-Time Key Checking
+
+A mistyped key never reaches your users as a raw key on screen; it fails the build.
+
+**String literals are checked by `t!`.** Every literal key is checked at compile time against the message IDs and `message.attribute` keys found in *any* locale, on stable Rust and without a proc-macro. Existing `t!("literal")` calls compile unchanged, and the check costs nothing at run time (it runs in a `const` item: a binary search over a sorted key list the build script generates).
+
+```rust
+let title = t!("app-titel");
+// error[E0080]: evaluation panicked: unknown Fluent message key passed to `t!`: app-titel
+```
+
+Only literals are checked: a key held in a variable or constant is looked up at run time as before. To pass a key that is deliberately missing from every locale, bind it to a variable first.
+
+**Every key is also a constant.** The generated code contains a `keys` module with one `pub const` per message ID and per attribute key (`login.tooltip` becomes `LOGIN_TOOLTIP`), documented with its source in the fallback locale (`en-US`), so your IDE can autocomplete keys and show the text on hover:
+
+```rust
+let title = t!(keys::APP_TITLE);
+let welcome = t!(keys::WELCOME_USER, { "name" => "Alice" });
+let tooltip = t!(keys::LOGIN_TOOLTIP);
+```
+
+Constant names are derived deterministically:
+
+- ASCII letters are uppercased and ASCII digits kept; every other character (`-`, `_`, `.`, anything non-ASCII) becomes `_`, so `app-title` becomes `APP_TITLE`.
+- A name that would not start with an ASCII letter is prefixed with `KEY_`.
+- If several IDs map to the same name (`foo-bar` and `foo_bar`), they are sorted by byte order: the first keeps the plain name and each later one gets `_2`, `_3`, ... (skipping any name that another ID maps to on its own), and the build prints a `cargo:warning` naming the constant it received.
+
+> **Note:** the generated file now defines a `keys` module and a hidden `__FLUENT_ZERO_KEYS` constant next to `CACHE` and `LOCALES`, so it cannot be included into a module that already has its own item named `keys`. Keep `fluent-zero` and `fluent-zero-build` on the same version: `t!` refers to the generated key list.
 
 ## 📦 Library Support & Nested Translations
 

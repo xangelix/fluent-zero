@@ -1,5 +1,6 @@
 use fluent_zero::{CacheEntry, FluentArgs, set_lang, t};
-use fluent_zero_integration::{CACHE, LOCALES};
+// `t!` resolves these through `crate::`, as in a consumer crate.
+use fluent_zero_integration::{__FLUENT_ZERO_KEYS, CACHE, LOCALES};
 
 /// Formats `key` (`message` or `message.attribute`) with the runtime bundle,
 /// bypassing the static cache.
@@ -120,9 +121,11 @@ fn attribute_lookups_through_t_macro() {
         t!("login.greeting", { "name" => "Bob" }),
         "Welcome back, \u{2068}Bob\u{2069}"
     );
-    // Missing everywhere: the key itself.
-    assert_eq!(t!("login.nope"), "login.nope");
-    assert_eq!(t!("nope.tooltip"), "nope.tooltip");
+    // Missing everywhere: the key itself. A literal unknown key is a compile
+    // error, so these go through runtime values.
+    let (missing_attr, missing_msg) = ("login.nope", "nope.tooltip");
+    assert_eq!(t!(missing_attr), "login.nope");
+    assert_eq!(t!(missing_msg), "nope.tooltip");
 
     set_lang("en-US".parse().unwrap());
 }
