@@ -9,7 +9,8 @@ use std::{
 };
 
 use fluent_zero::{set_lang, t};
-use fluent_zero_integration::{CACHE, LOCALES};
+// `t!` resolves these through `crate::`, as in a consumer crate.
+use fluent_zero_integration::{__FLUENT_ZERO_KEYS, CATALOG};
 
 struct CountingAlloc;
 
