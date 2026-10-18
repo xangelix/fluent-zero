@@ -1,4 +1,8 @@
-use std::{borrow::Cow, collections::HashMap};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    sync::{Mutex, MutexGuard},
+};
 
 // Imports
 use fluent_zero::{
@@ -100,10 +104,21 @@ emoji = { "😀" }
     }
 }
 
+// The current language is process-global and tests run in parallel, so every
+// test that sets it holds this lock for its whole body.
+static LANG_LOCK: Mutex<()> = Mutex::new(());
+
+fn lang_lock() -> MutexGuard<'static, ()> {
+    LANG_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 // --- TEST CASES ---
 
 #[test]
 fn t01_static_hit_returns_borrowed() {
+    let _lang = lang_lock();
     let mocks = MockLocales::new();
     set_lang("en-US".parse().unwrap());
 
@@ -117,6 +132,7 @@ fn t01_static_hit_returns_borrowed() {
 
 #[test]
 fn t02_static_miss_hits_bundle_via_dynamic_entry() {
+    let _lang = lang_lock();
     let mocks = MockLocales::new();
     set_lang("en-US".parse().unwrap());
 
@@ -129,6 +145,7 @@ fn t02_static_miss_hits_bundle_via_dynamic_entry() {
 
 #[test]
 fn t03_dynamic_lookup_always_returns_owned_if_args_used() {
+    let _lang = lang_lock();
     let mocks = MockLocales::new();
     set_lang("en-US".parse().unwrap());
 
@@ -142,6 +159,7 @@ fn t03_dynamic_lookup_always_returns_owned_if_args_used() {
 
 #[test]
 fn t04_fallback_static_returns_borrowed() {
+    let _lang = lang_lock();
     let mocks = MockLocales::new();
     set_lang("de-DE".parse().unwrap()); // Unknown language
 
@@ -154,6 +172,7 @@ fn t04_fallback_static_returns_borrowed() {
 
 #[test]
 fn t06_language_switch_updates_static_return() {
+    let _lang = lang_lock();
     let mocks = MockLocales::new();
 
     set_lang("en-US".parse().unwrap());
@@ -171,6 +190,7 @@ fn t06_language_switch_updates_static_return() {
 
 #[test]
 fn t08_verify_zero_copy_pointer_address() {
+    let _lang = lang_lock();
     // This test performs pointer arithmetic to guarantee that the string returned
     // by lookup_static is the exact same memory address as the string stored
     // in the mock cache (simulating the .rodata segment).
