@@ -12,8 +12,13 @@ categories.workspace = true
 keywords.workspace = true
 
 [dependencies]
-arc-swap = "1"
+arc-swap = "1.4"
 fluent-bundle = "0.16"
 fluent-syntax = "0.12"
 phf = { version = "0.14", features = ["macros"] }
 unic-langid = "0.9"
+tracing = { version = "0.1", optional = true, default-features = false, features = ["std"] }
+
+[features]
+# Log every `LookupError` with `tracing::warn!` (target `fluent_zero`).
+tracing = ["dep:tracing"]
