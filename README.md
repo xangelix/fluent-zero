@@ -285,6 +285,17 @@ While `fluent-zero` is faster at runtime, it comes with trade-offs compared to `
 2. **Binary Size**: Static strings are embedded into the binary executable code.
 3. **Flexibility**: You cannot easily load new FTL files from the filesystem at runtime without restarting the application (the cache is baked in).
 
+## Stability and MSRV Policy
+
+- **Versioning**: the crates follow [Semantic Versioning](https://semver.org/). While on `0.x`, breaking changes bump the minor version (`0.1` to `0.2`) and are listed in `CHANGELOG.md`; patch releases are non-breaking.
+- **Generated code**: `fluent-zero` and `fluent-zero-build` are released together with the same version. Use matching versions; the generated code is only guaranteed to compile against the runtime of the same release.
+- **MSRV**: the minimum supported Rust version is the `rust-version` declared in each crate's `Cargo.toml`. It is only raised in a minor release (never a patch release) and the change is noted in `CHANGELOG.md`.
+- **Security**: see [`SECURITY.md`](SECURITY.md) for supported versions and how to report a vulnerability privately.
+
+## Performance
+
+`cargo bench -p fluent-zero-integration` benchmarks static, dynamic, fallback and missing-key lookups against real generated code, and `cargo test -p fluent-zero-integration --test zero_alloc` asserts with a counting allocator that static lookups (including through the en-US fallback) perform zero heap allocations.
+
 ## License
 
 This project is licensed under the [MIT license](https://spdx.org/licenses/MIT).
