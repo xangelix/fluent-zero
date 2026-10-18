@@ -6,8 +6,8 @@ use std::{
 };
 
 use fluent_zero::{
-    FluentArgs, LocaleState, LookupError, clear_error_handler, lookup_dynamic, lookup_dynamic_in,
-    lookup_static, set_error_handler, set_lang, t_in,
+    __private::{lookup_dynamic, lookup_dynamic_in, lookup_static},
+    FluentArgs, LocaleState, LookupError, clear_error_handler, set_error_handler, set_lang, t_in,
 };
 // `t_in!` resolves these through `crate::`, as in a consumer crate.
 use fluent_zero_integration::{__FLUENT_ZERO_KEYS, CACHE, CATALOG, LOCALES};

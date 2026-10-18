@@ -33,11 +33,11 @@ You need both the runtime library and the build-time code generator.
 
 ```toml
 [dependencies]
-fluent-zero = "0.1"
+fluent-zero = "0.2"
 unic-langid = "0.9"
 
 [build-dependencies]
-fluent-zero-build = "0.1"
+fluent-zero-build = "0.2"
 ```
 
 ### 2. File Structure
@@ -65,6 +65,27 @@ fn main() {
     fluent_zero_build::generate_static_cache("assets/locales");
 }
 ```
+
+For more control, use the builder. `try_generate()` returns a
+`Result<(), fluent_zero_build::Error>` (missing `OUT_DIR`, unreadable files, FTL
+syntax errors, duplicate message IDs, an invalid or missing fallback locale,
+missing translations under `MissingTranslations::Deny`) instead of panicking
+like `generate()`:
+
+```rust
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    fluent_zero_build::FluentZeroBuilder::new("assets/locales")
+        // Only needed if fluent-zero is renamed in Cargo.toml,
+        // e.g. `fz = { package = "fluent-zero", version = "..." }`.
+        .crate_path("::fz")
+        .try_generate()?;
+    Ok(())
+}
+```
+
+Keep `fluent-zero` and `fluent-zero-build` on matching releases. The generated
+code checks that it was produced for the runtime it is compiled against; a
+mismatched pair fails to compile with a message saying which crate to upgrade.
 
 ### 4. Application Code
 
@@ -148,8 +169,6 @@ let title = t_in!(&lang, "app-title");          // still zero-allocation
 let welcome = t_in!(&lang, "welcome-user", { "name" => "Alice" });
 ```
 
-`lookup_static_in` and `lookup_dynamic_in` are the function equivalents.
-
 ### 7. Compile-Time Key Checking
 
 A mistyped key never reaches your users as a raw key on screen; it fails the build.
@@ -177,7 +196,21 @@ Constant names are derived deterministically:
 - A name that would not start with an ASCII letter is prefixed with `KEY_`.
 - If several IDs map to the same name (`foo-bar` and `foo_bar`), they are sorted by byte order: the first keeps the plain name and each later one gets `_2`, `_3`, ... (skipping any name that another ID maps to on its own), and the build prints a `cargo:warning` naming the constant it received.
 
-> **Note:** the generated file now defines a `keys` module and a hidden `__FLUENT_ZERO_KEYS` constant next to `CATALOG`, `CACHE` and `LOCALES`, so it cannot be included into a module that already has its own item named `keys`. Keep `fluent-zero` and `fluent-zero-build` on the same version: `t!` and `t_in!` refer to the generated key list.
+> **Note:** the generated file now defines a `keys` module and a hidden `__FLUENT_ZERO_KEYS` constant next to `CATALOG`, `CACHE` and `LOCALES`, so it cannot be included into a module that already has its own item named `keys`. Keep `fluent-zero` and `fluent-zero-build` on matching releases: the generated code checks that it was produced for the runtime it is compiled against.
+
+### 8. Public API
+
+`fluent_zero::get_lang()` returns an `Arc<LocaleState>` snapshot of the active
+language; `.id()` gives the `LanguageIdentifier`, `.key()` its string form
+(e.g. `"fr-FR"`) and `.chain()` the locale keys a lookup tries.
+
+The public API of `fluent-zero` is `t!`, `t_in!`, `set_lang`, `get_lang`,
+`LocaleState`, `Catalog` (the type of the generated `CATALOG`), `CacheEntry`,
+`DEFAULT_FALLBACK`, `join_charsets`, the diagnostics (`set_error_handler`,
+`clear_error_handler`, `LookupError`, `FormatErrors`, `ErrorHandler`) and the
+re-exported `LanguageIdentifier` and `FluentArgs`. The hidden
+`fluent_zero::__private` module exists for the macros and the generated code
+and may change in any release.
 
 ## 🩺 Diagnostics
 
@@ -194,20 +227,20 @@ set_error_handler(|error: &LookupError| match error {
 });
 ```
 
-`LookupError` covers a key found in neither the current nor the fallback language (`MissingKey`; for a `message.attribute` key this includes a message that lacks that attribute), a bare lookup of a message that has only attributes (`MissingValue`; look up `message.attribute` instead), and partial formatting such as a missing argument (`Format`, with the `fluent-bundle` errors). A key missing from the current language but found through its fallback chain or in the fallback locale is not an error. Misses through `t_in!`, `lookup_static_in` and `lookup_dynamic_in` are reported too, with the `LocaleState`'s language. `clear_error_handler()` removes the handler.
+`LookupError` covers a key found in neither the current nor the fallback language (`MissingKey`; for a `message.attribute` key this includes a message that lacks that attribute), a bare lookup of a message that has only attributes (`MissingValue`; look up `message.attribute` instead), and partial formatting such as a missing argument (`Format`, whose `errors` field lists the `fluent-bundle` errors as `std::error::Error`s). A key missing from the current language but found through its fallback chain or in the fallback locale is not an error. Misses through `t_in!` are reported too, with the `LocaleState`'s language. `clear_error_handler()` removes the handler.
 
 Alternatively, enable the off-by-default `tracing` feature to log every `LookupError` with `tracing::warn!` (target `fluent_zero`):
 
 ```toml
-fluent-zero = { version = "0.1", features = ["tracing"] }
+fluent-zero = { version = "0.2", features = ["tracing"] }
 ```
 
 ### Build errors
 
-An `.ftl` syntax error fails the build with the file, line and column of each error and the offending line:
+`FluentZeroBuilder::try_generate()` returns every build failure as a `fluent_zero_build::Error` (`Parse`, `DuplicateId`, `InvalidFallbackLocale`, `MissingFallbackLocale`, `MissingTranslations`, `Io`, ...); `generate()` panics with the same message, prefixed with `fluent-zero-build: `. An `.ftl` syntax error reports the file, line and column of each error and the offending line:
 
 ```text
-failed to parse assets/locales/en-US/main.ftl:
+fluent-zero-build: failed to parse assets/locales/en-US/main.ftl:
 assets/locales/en-US/main.ftl:2:8: Expected a token starting with "="
 2 | broken Value
   |        ^

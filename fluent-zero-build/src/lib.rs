@@ -1,10 +1,40 @@
+//! # fluent-zero-build
+//!
+//! Build-time code generator for [`fluent-zero`](https://docs.rs/fluent-zero).
+//! Call it from `build.rs`; it compiles the `.ftl` files of every locale
+//! directory into `$OUT_DIR/static_cache.rs`, which the consuming crate
+//! `include!`s at its root.
+//!
+//! ```rust,no_run
+//! // In build.rs's `main`:
+//! fluent_zero_build::FluentZeroBuilder::new("assets/locales").generate();
+//! ```
+//!
+//! [`FluentZeroBuilder::try_generate`] reports every failure as an [`Error`]
+//! instead of panicking:
+//!
+//! ```rust,no_run
+//! use fluent_zero_build::{FluentZeroBuilder, MissingTranslations};
+//!
+//! fn main() -> Result<(), fluent_zero_build::Error> {
+//!     FluentZeroBuilder::new("assets/locales")
+//!         .fallback_locale("en-US")
+//!         .missing_translations(MissingTranslations::Deny)
+//!         .try_generate()
+//! }
+//! ```
+
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+#![deny(rustdoc::broken_intra_doc_links)]
+
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     env,
     ffi::OsString,
-    fmt::Write as _,
+    fmt::{self, Write as _},
     fs,
-    io::Write as _,
+    io::{self, Write},
     path::{Path, PathBuf},
 };
 
@@ -13,12 +43,157 @@ use fluent_langneg::{NegotiationStrategy, negotiate_languages};
 use fluent_syntax::{ast, parser, serializer, unicode::unescape_unicode_to_string};
 use unic_langid::{LanguageIdentifier, subtags};
 
+/// The contract version between the generated code and the `fluent-zero`
+/// runtime; must equal `fluent_zero::__private::CODEGEN_VERSION`.
+///
+/// The generated file asserts it at compile time, so a mismatched pair of
+/// crates fails with a message saying which one to upgrade. It is a plain
+/// counter, independent of the crates' semver versions: bump it in both crates,
+/// to the same value, whenever the generated code changes what it needs from
+/// the runtime.
+const CODEGEN_VERSION: u32 = 1;
+
+/// The path the generated code uses for the runtime crate unless
+/// [`FluentZeroBuilder::crate_path`] overrides it.
+const DEFAULT_CRATE_PATH: &str = "::fluent_zero";
+
 /// The fallback locale when none is configured, matching the runtime's
 /// `fluent_zero::DEFAULT_FALLBACK`.
 const DEFAULT_FALLBACK: &str = "en-US";
 
 /// How many missing message IDs a coverage report names per locale.
 const COVERAGE_SAMPLE: usize = 5;
+
+/// Why [`FluentZeroBuilder::try_generate`] failed.
+///
+/// [`FluentZeroBuilder::generate`] panics with this error's `Display` text,
+/// prefixed with `fluent-zero-build: `.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum Error {
+    /// The `OUT_DIR` environment variable is not set, i.e. the builder is not
+    /// running inside a Cargo build script.
+    MissingOutDir,
+    /// The path given to [`FluentZeroBuilder::crate_path`] is not a Rust path.
+    InvalidCratePath(String),
+    /// The locale given to [`FluentZeroBuilder::fallback_locale`] is not a
+    /// valid language identifier.
+    InvalidFallbackLocale {
+        /// The locale as configured.
+        locale: String,
+        /// Why it does not parse.
+        reason: String,
+    },
+    /// The locales directory holds locales, but none of them is the
+    /// configured [fallback locale](FluentZeroBuilder::fallback_locale).
+    MissingFallbackLocale {
+        /// The configured fallback locale, in canonical form.
+        locale: String,
+        /// The locales directory that was searched.
+        locales_dir: PathBuf,
+        /// The locales that do exist, sorted.
+        available: Vec<String>,
+    },
+    /// Reading a locale file or writing generated output failed.
+    Io {
+        /// The file or directory being read or written.
+        path: PathBuf,
+        /// The underlying error.
+        source: io::Error,
+    },
+    /// A message or term ID is defined more than once within one locale.
+    DuplicateId {
+        /// The ID as written (terms keep their `-` prefix).
+        id: String,
+        /// The locale, e.g. `en-US`.
+        lang: String,
+        /// File and 1-based line of the first definition.
+        first: (PathBuf, usize),
+        /// File and 1-based line of the repeated definition.
+        second: (PathBuf, usize),
+    },
+    /// An `.ftl` file contains syntax errors.
+    Parse {
+        /// The offending file.
+        path: PathBuf,
+        /// Every error in the file, each as `path:line:col: error` followed by
+        /// the offending source line and a caret under the error position.
+        message: String,
+    },
+    /// Translations are missing under [`MissingTranslations::Deny`].
+    MissingTranslations {
+        /// One line per incomplete locale, sorted by locale: how many
+        /// messages of the fallback locale it lacks and the first few IDs.
+        report: Vec<String>,
+    },
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingOutDir => {
+                f.write_str("OUT_DIR is not set; fluent-zero-build must run from a build script")
+            }
+            Self::InvalidCratePath(path) => write!(
+                f,
+                "invalid crate path {path:?}: expected a Rust path such as \"::fluent_zero\""
+            ),
+            Self::InvalidFallbackLocale { locale, reason } => write!(
+                f,
+                "fallback locale `{locale}` is not a valid language identifier: {reason}"
+            ),
+            Self::MissingFallbackLocale {
+                locale,
+                locales_dir,
+                available,
+            } => write!(
+                f,
+                "fallback locale `{locale}` has no directory in {} (available: {})",
+                locales_dir.display(),
+                available.join(", ")
+            ),
+            Self::Io { path, source } => write!(f, "{}: {source}", path.display()),
+            Self::DuplicateId {
+                id,
+                lang,
+                first,
+                second,
+            } => write!(
+                f,
+                "`{id}` is defined twice in locale `{lang}`: \
+                 first at {}:{}, again at {}:{}. \
+                 Fluent bundles allow one definition per ID; rename or remove one.",
+                first.0.display(),
+                first.1,
+                second.0.display(),
+                second.1,
+            ),
+            Self::Parse { path, message } => {
+                write!(f, "failed to parse {}:\n{message}", path.display())
+            }
+            Self::MissingTranslations { report } => {
+                write!(f, "missing translations:\n{}", report.join("\n"))
+            }
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+/// Adapts an [`io::Error`] on `path` into an [`Error`], for `map_err`.
+fn io_err(path: &Path) -> impl FnOnce(io::Error) -> Error + '_ {
+    move |source| Error::Io {
+        path: path.to_path_buf(),
+        source,
+    }
+}
 
 /// What the builder does about messages present in the fallback locale but
 /// missing from another locale.
@@ -29,14 +204,17 @@ pub enum MissingTranslations {
     /// Emit one `cargo:warning` per incomplete locale (the default).
     #[default]
     Warn,
-    /// Fail the build, listing every incomplete locale.
+    /// Fail the build, listing every incomplete locale
+    /// ([`Error::MissingTranslations`]).
     Deny,
 }
 
 /// A builder to configure and generate the static cache code for `fluent-zero`.
+#[derive(Debug, Clone)]
 pub struct FluentZeroBuilder {
     locales_dir: PathBuf,
     charset_dest: Option<PathBuf>,
+    crate_path: String,
     fallback_locale: Option<String>,
     missing_translations: MissingTranslations,
     use_isolating: bool,
@@ -59,10 +237,23 @@ impl FluentZeroBuilder {
         Self {
             locales_dir: locales_dir_path.as_ref().to_path_buf(),
             charset_dest: None,
+            crate_path: DEFAULT_CRATE_PATH.to_string(),
             fallback_locale: None,
             missing_translations: MissingTranslations::default(),
             use_isolating: true,
         }
+    }
+
+    /// Sets the path the generated code uses to reach the `fluent-zero` crate.
+    ///
+    /// Defaults to `::fluent_zero`. Set it when the dependency is renamed in
+    /// `Cargo.toml`, e.g. `fz = { package = "fluent-zero", ... }` needs
+    /// `.crate_path("::fz")`. An invalid path makes
+    /// [`try_generate`](Self::try_generate) return [`Error::InvalidCratePath`].
+    #[must_use]
+    pub fn crate_path(mut self, path: impl Into<String>) -> Self {
+        self.crate_path = path.into();
+        self
     }
 
     /// Sets how messages present in the fallback locale (see
@@ -98,9 +289,11 @@ impl FluentZeroBuilder {
     /// It is also the locale the [missing translations](Self::missing_translations)
     /// report compares every other locale against, and the one whose source
     /// documents the generated `keys` constants.
-    /// When the locales directory holds any locale, [`generate`](Self::generate)
-    /// fails the build unless one of them is this locale, so a typo cannot
-    /// silently disable the fallback.
+    /// When the locales directory holds any locale,
+    /// [`try_generate`](Self::try_generate) returns
+    /// [`Error::MissingFallbackLocale`] unless one of them is this locale, so a
+    /// typo cannot silently disable the fallback; a locale that does not parse
+    /// is [`Error::InvalidFallbackLocale`].
     #[must_use]
     pub fn fallback_locale(mut self, locale: &str) -> Self {
         self.fallback_locale = Some(locale.to_string());
@@ -125,20 +318,46 @@ impl FluentZeroBuilder {
     /// Consumes the builder, parses the Fluent files, aggregates IPC variables,
     /// and generates the Rust static cache code.
     ///
+    /// This is the panicking convenience over [`try_generate`](Self::try_generate),
+    /// meant for build scripts where a panic is the natural way to fail.
+    ///
     /// # Panics
     ///
-    /// Panics if the `OUT_DIR` environment variable is not set, if critical
-    /// IO file system operations fail during compilation, if an `.ftl` file
-    /// has a syntax error (reported as `path:line:col: error`), if
-    /// translations are missing under [`MissingTranslations::Deny`], or if the
-    /// configured fallback locale is not a valid language identifier or (when
-    /// the locales directory holds any locale) is not one of them.
+    /// Panics with the error's message (prefixed with `fluent-zero-build: `)
+    /// whenever [`try_generate`](Self::try_generate) returns an error.
     pub fn generate(self) {
-        let out_dir = env::var("OUT_DIR").expect("OUT_DIR not set");
-        let dest_path = Path::new(&out_dir).join("static_cache.rs");
-        let mut file = fs::File::create(&dest_path).expect("Failed to create static_cache.rs");
+        if let Err(err) = self.try_generate() {
+            panic!("fluent-zero-build: {err}");
+        }
+    }
 
-        writeln!(&mut file, "// @generated by fluent-zero-build").unwrap();
+    /// Consumes the builder, parses the Fluent files, aggregates IPC variables,
+    /// and generates the Rust static cache code.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if `OUT_DIR` is not set, the
+    /// [`crate_path`](Self::crate_path) is invalid, the
+    /// [`fallback_locale`](Self::fallback_locale) is invalid or has no
+    /// directory, an `.ftl` file fails to parse, an ID is defined twice in one
+    /// locale, translations are missing under [`MissingTranslations::Deny`],
+    /// or reading the locales or writing the output fails.
+    pub fn try_generate(self) -> Result<(), Error> {
+        if !is_rust_path(&self.crate_path) {
+            return Err(Error::InvalidCratePath(self.crate_path));
+        }
+        let fallback = self.fallback_key()?;
+        let out_dir = env::var("OUT_DIR").map_err(|_| Error::MissingOutDir)?;
+        let dest_path = Path::new(&out_dir).join("static_cache.rs");
+        let mut file = fs::File::create(&dest_path).map_err(io_err(&dest_path))?;
+        let krate = self.crate_path.as_str();
+
+        writeln!(
+            &mut file,
+            "// @generated by fluent-zero-build\n\
+             const _: () = {krate}::__private::assert_codegen_version({CODEGEN_VERSION});"
+        )
+        .map_err(io_err(&dest_path))?;
 
         let mut unique_chars: BTreeSet<char> = BTreeSet::new();
 
@@ -156,7 +375,6 @@ impl FluentZeroBuilder {
             }
         }
 
-        let fallback = self.fallback_key();
         let mut bundle_entries: Vec<(String, String)> = Vec::new();
         let mut cache_root_entries: Vec<(String, String)> = Vec::new();
         let mut available: Vec<LanguageIdentifier> = Vec::new();
@@ -169,7 +387,7 @@ impl FluentZeroBuilder {
             println!("cargo:rerun-if-changed={}", self.locales_dir.display());
 
             // Sorted so the generated file is identical on every filesystem.
-            for path in sorted_dir_entries(&self.locales_dir) {
+            for path in sorted_dir_entries(&self.locales_dir)? {
                 if !path.is_dir() {
                     continue;
                 }
@@ -192,9 +410,9 @@ impl FluentZeroBuilder {
                     &lang_key,
                     &mut unique_chars,
                     self.use_isolating,
-                );
+                )?;
                 let cache_entries =
-                    static_cache_entries(&lang_id, &combined_ftl_source, self.use_isolating);
+                    static_cache_entries(krate, &lang_id, &combined_ftl_source, self.use_isolating);
                 all_keys.extend(cache_entries.iter().map(|(key, _)| key.clone()));
                 if lang_key == fallback {
                     fallback_sources = message_sources(&combined_ftl_source);
@@ -202,12 +420,15 @@ impl FluentZeroBuilder {
 
                 Self::write_bundle_initializer(
                     &mut file,
+                    krate,
                     &bundle_name,
                     &lang_key,
                     &combined_ftl_source,
                     self.use_isolating,
-                );
-                Self::write_cache_map(&mut file, &cache_name, &cache_entries);
+                )
+                .map_err(io_err(&dest_path))?;
+                Self::write_cache_map(&mut file, krate, &cache_name, &cache_entries)
+                    .map_err(io_err(&dest_path))?;
 
                 // Coverage is per message: attribute keys (`message.attribute`)
                 // are left out, so a message counts as translated once its ID is.
@@ -235,20 +456,23 @@ impl FluentZeroBuilder {
         if self.fallback_locale.is_some()
             && let Err(available) = check_fallback(&fallback, &available)
         {
-            panic!(
-                "fluent-zero-build: fallback locale `{fallback}` has no directory in {} (available: {available})",
-                self.locales_dir.display(),
-            );
+            return Err(Error::MissingFallbackLocale {
+                locale: fallback,
+                locales_dir: self.locales_dir,
+                available,
+            });
         }
 
-        self.check_coverage(&message_ids);
+        self.check_coverage(&fallback, &message_ids)?;
 
         // 3. Complete Code Generation & Upstream Exporting
         // This unconditionally runs to guarantee valid empty PHF maps in aggregator crates.
-        Self::write_root_maps(&mut file, &cache_root_entries, &bundle_entries);
-        Self::write_catalog(&mut file, &fallback, &available);
-        Self::write_keys(&mut file, &all_keys, &fallback, &fallback_sources);
-        self.export_charset_data(&mut file, &unique_chars, &out_dir);
+        Self::write_root_maps(&mut file, krate, &cache_root_entries, &bundle_entries)
+            .map_err(io_err(&dest_path))?;
+        Self::write_catalog(&mut file, krate, &fallback, &available).map_err(io_err(&dest_path))?;
+        Self::write_keys(&mut file, &all_keys, &fallback, &fallback_sources)
+            .map_err(io_err(&dest_path))?;
+        self.export_charset_data(&mut file, &dest_path, &unique_chars, &out_dir)
     }
 
     fn process_locale_dir(
@@ -256,23 +480,28 @@ impl FluentZeroBuilder {
         lang_key: &str,
         unique_chars: &mut BTreeSet<char>,
         use_isolating: bool,
-    ) -> String {
+    ) -> Result<String, Error> {
         let mut combined_ftl_source = String::new();
         let mut definitions = Definitions::default();
         let mut emits_isolation_marks = false;
 
-        for file_path in sorted_dir_entries(path) {
+        for file_path in sorted_dir_entries(path)? {
             if file_path.extension().is_some_and(|ext| ext == "ftl") {
                 println!("cargo:rerun-if-changed={}", file_path.display());
-                let source = fs::read_to_string(&file_path).expect("Failed to read FTL file");
+                let source = fs::read_to_string(&file_path).map_err(io_err(&file_path))?;
 
                 combined_ftl_source.push_str(&source);
                 combined_ftl_source.push('\n');
 
-                definitions.record(lang_key, &file_path, &source);
+                definitions.record(lang_key, &file_path, &source)?;
                 let ast = match parser::parse(source.clone()) {
                     Ok(ast) => ast,
-                    Err((_, errors)) => panic!("{}", syntax_report(&file_path, &source, &errors)),
+                    Err((_, errors)) => {
+                        return Err(Error::Parse {
+                            message: syntax_report(&file_path, &source, &errors),
+                            path: file_path,
+                        });
+                    }
                 };
                 for entry in ast.body {
                     match entry {
@@ -300,36 +529,40 @@ impl FluentZeroBuilder {
             unique_chars.extend(['\u{2068}', '\u{2069}']);
         }
 
-        combined_ftl_source
+        Ok(combined_ftl_source)
     }
 
-    /// Reports message IDs of the fallback locale missing from other locales,
-    /// as configured by [`Self::missing_translations`].
-    fn check_coverage(&self, message_ids: &[(String, BTreeSet<String>)]) {
+    /// Reports message IDs of the `fallback` locale missing from other
+    /// locales, as configured by [`Self::missing_translations`].
+    fn check_coverage(
+        &self,
+        fallback: &str,
+        message_ids: &[(String, BTreeSet<String>)],
+    ) -> Result<(), Error> {
         if self.missing_translations == MissingTranslations::Allow {
-            return;
+            return Ok(());
         }
-        let report = coverage_report(&self.fallback_key(), message_ids);
+        let report = coverage_report(fallback, message_ids);
         if report.is_empty() {
-            return;
+            return Ok(());
         }
-        assert!(
-            self.missing_translations != MissingTranslations::Deny,
-            "missing translations:\n{}",
-            report.join("\n")
-        );
+        if self.missing_translations == MissingTranslations::Deny {
+            return Err(Error::MissingTranslations { report });
+        }
         for line in report {
             println!("cargo:warning={line}");
         }
+        Ok(())
     }
 
     fn write_bundle_initializer(
-        file: &mut fs::File,
+        file: &mut impl Write,
+        krate: &str,
         bundle_name: &str,
         lang_key: &str,
         combined_ftl_source: &str,
         use_isolating: bool,
-    ) {
+    ) -> io::Result<()> {
         let escaped_ftl = format!("{combined_ftl_source:?}");
         let isolating_code = if use_isolating {
             ""
@@ -347,91 +580,105 @@ impl FluentZeroBuilder {
         //   resource can fail; overriding makes that infallible by signature.
         let init_code = format!(
             "std::sync::LazyLock::new(|| {{\n\
-            \x20   let lang: ::fluent_zero::LanguageIdentifier = \"{lang_key}\".parse().unwrap_or_default();\n\
-            \x20   let mut bundle = ::fluent_zero::ConcurrentFluentBundle::new_concurrent(vec![lang]);\n\
+            \x20   let lang: {krate}::LanguageIdentifier = \"{lang_key}\".parse().unwrap_or_default();\n\
+            \x20   let mut bundle = {krate}::__private::ConcurrentFluentBundle::new_concurrent(vec![lang]);\n\
             {isolating_code}\
-            \x20   let res = ::fluent_zero::FluentResource::try_new({escaped_ftl}.to_string()).unwrap_or_else(|(res, _)| res);\n\
+            \x20   let res = {krate}::__private::FluentResource::try_new({escaped_ftl}.to_string()).unwrap_or_else(|(res, _)| res);\n\
             \x20   bundle.add_resource_overriding(res);\n\
             \x20   bundle\n\
             }})"
         );
         writeln!(
             file,
-            "static {bundle_name}: std::sync::LazyLock<::fluent_zero::ConcurrentFluentBundle<::fluent_zero::FluentResource>> = {init_code};"
-        ).unwrap();
+            "static {bundle_name}: std::sync::LazyLock<{krate}::__private::ConcurrentFluentBundle<{krate}::__private::FluentResource>> = {init_code};"
+        )
     }
 
-    fn write_cache_map(file: &mut fs::File, cache_name: &str, cache_entries: &[(String, String)]) {
+    fn write_cache_map(
+        file: &mut impl Write,
+        krate: &str,
+        cache_name: &str,
+        cache_entries: &[(String, String)],
+    ) -> io::Result<()> {
+        let phf_path = format!("{krate}::__private::phf");
         let mut map = phf_codegen::Map::new();
-        map.phf_path("::fluent_zero::phf");
+        map.phf_path(&phf_path);
         for (k, v) in cache_entries {
             map.entry(k.as_str(), v.as_str());
         }
         writeln!(
             file,
-            "static {cache_name}: ::fluent_zero::phf::Map<&'static str, ::fluent_zero::CacheEntry> = {};",
+            "static {cache_name}: {phf_path}::Map<&'static str, {krate}::CacheEntry> = {};",
             map.build()
-        ).unwrap();
+        )
     }
 
     fn write_root_maps(
-        file: &mut fs::File,
+        file: &mut impl Write,
+        krate: &str,
         cache_root_entries: &[(String, String)],
         bundle_entries: &[(String, String)],
-    ) {
+    ) -> io::Result<()> {
+        let phf_path = format!("{krate}::__private::phf");
         let mut root_map = phf_codegen::Map::new();
-        root_map.phf_path("::fluent_zero::phf");
+        root_map.phf_path(&phf_path);
         for (l, v) in cache_root_entries {
             root_map.entry(l.as_str(), format!("&{v}"));
         }
         writeln!(
             file,
-            "pub static CACHE: ::fluent_zero::phf::Map<&'static str, &'static ::fluent_zero::phf::Map<&'static str, ::fluent_zero::CacheEntry>> = {};",
+            "pub static CACHE: {phf_path}::Map<&'static str, &'static {phf_path}::Map<&'static str, {krate}::CacheEntry>> = {};",
             root_map.build()
-        ).unwrap();
+        )?;
 
         let mut bundle_map = phf_codegen::Map::new();
-        bundle_map.phf_path("::fluent_zero::phf");
+        bundle_map.phf_path(&phf_path);
         for (l, c) in bundle_entries {
             bundle_map.entry(l.as_str(), c.as_str());
         }
         writeln!(
             file,
-            "pub static LOCALES: ::fluent_zero::phf::Map<&'static str, &'static std::sync::LazyLock<::fluent_zero::ConcurrentFluentBundle<::fluent_zero::FluentResource>>> = {};",
+            "pub static LOCALES: {phf_path}::Map<&'static str, &'static std::sync::LazyLock<{krate}::__private::ConcurrentFluentBundle<{krate}::__private::FluentResource>>> = {};",
             bundle_map.build()
-        ).unwrap();
+        )
     }
 
     /// The canonical key of the configured fallback locale.
-    fn fallback_key(&self) -> String {
+    fn fallback_key(&self) -> Result<String, Error> {
         let Some(locale) = &self.fallback_locale else {
-            return DEFAULT_FALLBACK.to_string();
+            return Ok(DEFAULT_FALLBACK.to_string());
         };
         match locale.parse::<LanguageIdentifier>() {
-            Ok(id) => id.to_string(),
-            Err(err) => panic!(
-                "fluent-zero-build: fallback locale `{locale}` is not a valid language identifier: {err}"
-            ),
+            Ok(id) => Ok(id.to_string()),
+            Err(err) => Err(Error::InvalidFallbackLocale {
+                locale: locale.clone(),
+                reason: err.to_string(),
+            }),
         }
     }
 
     /// Writes `FALLBACK` and `CATALOG`, the tables the `t!` macros use: every
     /// locale under its own key plus the negotiation aliases of
     /// [`locale_aliases`], each pointing at the same cache and bundle statics.
-    fn write_catalog(file: &mut fs::File, fallback: &str, available: &[LanguageIdentifier]) {
+    fn write_catalog(
+        file: &mut impl Write,
+        krate: &str,
+        fallback: &str,
+        available: &[LanguageIdentifier],
+    ) -> io::Result<()> {
         writeln!(
             file,
             "\n/// The locale lookups fall back to when the active language has no message.\n\
              pub const FALLBACK: &str = {fallback:?};"
-        )
-        .unwrap();
+        )?;
 
         let tables = |key: &str| {
             let suffix = table_suffix(key);
             format!("(&CACHE_{suffix}, &BUNDLE_{suffix})")
         };
+        let phf_path = format!("{krate}::__private::phf");
         let mut map = phf_codegen::Map::new();
-        map.phf_path("::fluent_zero::phf");
+        map.phf_path(&phf_path);
         for id in available {
             let key = id.to_string();
             let value = tables(&key);
@@ -442,34 +689,31 @@ impl FluentZeroBuilder {
         }
         writeln!(
             file,
-            "static CATALOG_LOCALES: ::fluent_zero::phf::Map<&'static str, ::fluent_zero::CatalogLocale> = {};",
+            "static CATALOG_LOCALES: {phf_path}::Map<&'static str, {krate}::__private::CatalogLocale> = {};",
             map.build()
-        )
-        .unwrap();
+        )?;
         writeln!(
             file,
             "/// This crate's lookup tables, with locale negotiation aliases, as used by `t!` and `t_in!`.\n\
-             pub static CATALOG: ::fluent_zero::Catalog = ::fluent_zero::Catalog::new(FALLBACK, &CATALOG_LOCALES);"
+             pub static CATALOG: {krate}::Catalog = {krate}::__private::catalog(FALLBACK, &CATALOG_LOCALES);"
         )
-        .unwrap();
     }
 
     /// Writes `pub mod keys` (one constant per message ID) and the sorted
     /// key list `t!` checks string literal keys against at compile time.
     fn write_keys(
-        file: &mut fs::File,
+        file: &mut impl Write,
         all_keys: &BTreeSet<String>,
         fallback: &str,
         fallback_sources: &HashMap<String, String>,
-    ) {
+    ) -> io::Result<()> {
         writeln!(
             file,
             "\n/// Every message ID and `message.attribute` key found in any locale, as a\n\
              /// constant. Using these instead of string literals turns a mistyped key\n\
              /// into a compile error.\n\
              pub mod keys {{"
-        )
-        .unwrap();
+        )?;
         for (name, key) in key_const_names(all_keys) {
             if name != key_const_base(key) {
                 println!(
@@ -494,10 +738,9 @@ impl FluentZeroBuilder {
             writeln!(
                 file,
                 "    #[doc = {doc:?}]\n    pub const {name}: &str = {key:?};"
-            )
-            .unwrap();
+            )?;
         }
-        writeln!(file, "}}").unwrap();
+        writeln!(file, "}}")?;
 
         // `t!` binary-searches this list in a `const` item, so it must stay
         // sorted by byte order: `BTreeSet<String>` iterates in exactly `str`'s `Ord`.
@@ -508,15 +751,15 @@ impl FluentZeroBuilder {
              #[doc(hidden)]\n\
              pub const __FLUENT_ZERO_KEYS: &[&str] = &{sorted:?};"
         )
-        .unwrap();
     }
 
     fn export_charset_data(
         &self,
-        file: &mut fs::File,
+        file: &mut impl Write,
+        dest_path: &Path,
         unique_chars: &BTreeSet<char>,
         out_dir: &str,
-    ) {
+    ) -> Result<(), Error> {
         let charset_string: String = unique_chars.iter().collect();
 
         // Embed the charset constant natively into the module.
@@ -526,7 +769,7 @@ impl FluentZeroBuilder {
              /// used across all `.ftl` files in this crate and its dependencies.\n\
              pub const CHARSET: &str = {charset_string:?};"
         )
-        .unwrap();
+        .map_err(io_err(dest_path))?;
 
         // 1. Emit absolute path for the NEXT build.rs to consume natively.
         // Cargo automatically captures this and converts it into `DEP_<LINKS>_FLUENT_CHARSET_PATH`.
@@ -550,11 +793,26 @@ impl FluentZeroBuilder {
             if let Some(parent) = charset_dest.parent() {
                 let _ = fs::create_dir_all(parent);
             }
-            write_if_changed(charset_dest, &charset_string)
-                .expect("Failed to write fluent charset file");
+            write_if_changed(charset_dest, &charset_string).map_err(io_err(charset_dest))?;
             println!("cargo:rerun-if-changed={}", charset_dest.display());
         }
+        Ok(())
     }
+}
+
+/// Whether `path` is a plain Rust path (`::a::b`, `a`, `crate::a`) that the
+/// generated code can prefix item paths with.
+fn is_rust_path(path: &str) -> bool {
+    let path = path.strip_prefix("::").unwrap_or(path);
+    !path.is_empty()
+        && path.split("::").all(|segment| {
+            let mut chars = segment.chars();
+            chars
+                .next()
+                .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+                && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+                && segment != "_"
+        })
 }
 
 /// The suffix of a locale's generated `CACHE_*` / `BUNDLE_*` statics.
@@ -564,14 +822,14 @@ fn table_suffix(lang_key: &str) -> String {
 
 /// Checks that `fallback` is one of the `available` locales, if there are any
 /// (crates that only aggregate dependencies have none). On failure, returns
-/// the sorted list of available locale keys for the error message.
-fn check_fallback(fallback: &str, available: &[LanguageIdentifier]) -> Result<(), String> {
+/// the sorted list of available locale keys for the error.
+fn check_fallback(fallback: &str, available: &[LanguageIdentifier]) -> Result<(), Vec<String>> {
     let mut keys: Vec<String> = available.iter().map(ToString::to_string).collect();
     if keys.is_empty() || keys.iter().any(|key| key == fallback) {
         return Ok(());
     }
     keys.sort();
-    Err(keys.join(", "))
+    Err(keys)
 }
 
 /// Maps the keys that end a runtime fallback chain to the best locale this
@@ -675,9 +933,10 @@ fn two_letter_regions() -> impl Iterator<Item = subtags::Region> {
 }
 
 /// Formats parser errors as `path:line:col: error`, each followed by the
-/// offending source line and a caret under the error position.
+/// offending source line and a caret under the error position, one per line
+/// (the [`Error::Parse`] message).
 fn syntax_report(path: &Path, source: &str, errors: &[parser::ParserError]) -> String {
-    let mut report = format!("failed to parse {}:", path.display());
+    let mut report = String::new();
     for error in errors {
         let offset = error.pos.start.min(source.len());
         // `floor_char_boundary` is unstable; offsets from the parser are
@@ -695,9 +954,12 @@ fn syntax_report(path: &Path, source: &str, errors: &[parser::ParserError]) -> S
         let line = source[line_start..line_end].trim_end_matches('\r');
         let gutter = " ".repeat(line_no.to_string().len());
         let caret_pad = " ".repeat(column - 1);
+        if !report.is_empty() {
+            report.push('\n');
+        }
         let _ = write!(
             report,
-            "\n{}:{line_no}:{column}: {error}\n{line_no} | {line}\n{gutter} | {caret_pad}^",
+            "{}:{line_no}:{column}: {error}\n{line_no} | {line}\n{gutter} | {caret_pad}^",
             path.display()
         );
     }
@@ -752,23 +1014,24 @@ struct Definitions {
 impl Definitions {
     /// Records every entry defined in `source`.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics with both locations when an ID is already defined in this locale.
-    fn record(&mut self, lang_key: &str, file: &Path, source: &str) {
+    /// Returns [`Error::DuplicateId`] with both locations when an ID is
+    /// already defined in this locale.
+    fn record(&mut self, lang_key: &str, file: &Path, source: &str) -> Result<(), Error> {
         for (id, line) in entry_definitions(source) {
-            if let Some((first_file, first_line)) = self.locations.get(id) {
-                panic!(
-                    "fluent-zero-build: `{id}` is defined twice in locale `{lang_key}`: \
-                     first at {}:{first_line}, again at {}:{line}. \
-                     Fluent bundles allow one definition per ID; rename or remove one.",
-                    first_file.display(),
-                    file.display(),
-                );
+            if let Some(first) = self.locations.get(id) {
+                return Err(Error::DuplicateId {
+                    id: id.to_string(),
+                    lang: lang_key.to_string(),
+                    first: first.clone(),
+                    second: (file.to_path_buf(), line),
+                });
             }
             self.locations
                 .insert(id.to_string(), (file.to_path_buf(), line));
         }
+        Ok(())
     }
 }
 
@@ -807,6 +1070,7 @@ fn entry_definitions(source: &str) -> impl Iterator<Item = (&str, usize)> {
 /// that fails to format cleanly stays dynamic so the runtime keeps its
 /// existing behaviour for it.
 fn static_cache_entries(
+    krate: &str,
     lang_id: &LanguageIdentifier,
     source: &str,
     use_isolating: bool,
@@ -830,7 +1094,7 @@ fn static_cache_entries(
             .as_ref()
             .filter(|_| analysis.message(id, None))
             .and_then(|pattern| format_static(&bundle, pattern));
-        entries.push((id.to_string(), cache_entry(static_value)));
+        entries.push((id.to_string(), cache_entry(krate, static_value)));
 
         let mut seen = HashSet::new();
         for attribute in &msg.attributes {
@@ -844,7 +1108,7 @@ fn static_cache_entries(
                 .message(id, Some(name))
                 .then(|| format_static(&bundle, &attribute.value))
                 .flatten();
-            entries.push((format!("{id}.{name}"), cache_entry(static_value)));
+            entries.push((format!("{id}.{name}"), cache_entry(krate, static_value)));
         }
     }
     entries
@@ -861,12 +1125,12 @@ fn format_static<'r>(
     errors.is_empty().then(|| value.into_owned())
 }
 
-fn cache_entry(static_value: Option<String>) -> String {
+fn cache_entry(krate: &str, static_value: Option<String>) -> String {
     match static_value {
         // `{:?}` on a `str` is a valid Rust string literal: quotes,
         // backslashes and invisible characters are all escaped.
-        Some(value) => format!("::fluent_zero::CacheEntry::Static({value:?})"),
-        None => "::fluent_zero::CacheEntry::Dynamic".to_string(),
+        Some(value) => format!("{krate}::CacheEntry::Static({value:?})"),
+        None => format!("{krate}::CacheEntry::Dynamic"),
     }
 }
 
@@ -1210,13 +1474,16 @@ fn extend_visible(unique_chars: &mut BTreeSet<char>, text: &str) {
 
 /// Lists the entries of `dir` sorted by path, so processing order (and with
 /// it the generated code) does not depend on the filesystem's `read_dir` order.
-fn sorted_dir_entries(dir: &Path) -> Vec<PathBuf> {
-    let mut paths: Vec<PathBuf> = fs::read_dir(dir)
-        .expect("Failed to read directory")
-        .map(|entry| entry.expect("Failed to read directory entry").path())
-        .collect();
+fn sorted_dir_entries(dir: &Path) -> Result<Vec<PathBuf>, Error> {
+    let mut paths = fs::read_dir(dir)
+        .and_then(|entries| {
+            entries
+                .map(|entry| entry.map(|entry| entry.path()))
+                .collect::<io::Result<Vec<PathBuf>>>()
+        })
+        .map_err(io_err(dir))?;
     paths.sort();
-    paths
+    Ok(paths)
 }
 
 /// Picks the charset files dependencies exported through Cargo's `links`
@@ -1276,7 +1543,13 @@ fn lexically_inside(path: &Path, base: &Path) -> bool {
     normalize(path).starts_with(normalize(base))
 }
 
-/// Generates the static cache code for `fluent-zero`.
+/// Generates the static cache code for `fluent-zero` from `locales_dir_path`
+/// with the default settings; shorthand for
+/// `FluentZeroBuilder::new(locales_dir_path).generate()`.
+///
+/// # Panics
+///
+/// Panics when [`FluentZeroBuilder::generate`] does.
 pub fn generate_static_cache(locales_dir_path: &str) {
     FluentZeroBuilder::new(locales_dir_path).generate();
 }
@@ -1325,7 +1598,7 @@ mod tests {
 
     /// The generated `CacheEntry` expression for each message, by id.
     fn entries(source: &str) -> HashMap<String, String> {
-        static_cache_entries(&"en-US".parse().unwrap(), source, true)
+        static_cache_entries(DEFAULT_CRATE_PATH, &"en-US".parse().unwrap(), source, true)
             .into_iter()
             .collect()
     }
@@ -1355,26 +1628,49 @@ bad id = not an entry
     #[test]
     fn terms_and_messages_have_separate_namespaces() {
         let mut definitions = Definitions::default();
-        definitions.record("en-US", Path::new("a.ftl"), "brand = Message\n");
-        definitions.record("en-US", Path::new("b.ftl"), "-brand = Term\n");
+        definitions
+            .record("en-US", Path::new("a.ftl"), "brand = Message\n")
+            .unwrap();
+        definitions
+            .record("en-US", Path::new("b.ftl"), "-brand = Term\n")
+            .unwrap();
     }
 
     #[test]
-    #[should_panic(
-        expected = "`hello` is defined twice in locale `en-US`: first at a.ftl:2, again at b.ftl:3"
-    )]
     fn duplicate_across_files_names_both_locations() {
         let mut definitions = Definitions::default();
-        definitions.record("en-US", Path::new("a.ftl"), "# header\nhello = Hi\n");
-        definitions.record("en-US", Path::new("b.ftl"), "x = 1\n\nhello = Again\n");
+        definitions
+            .record("en-US", Path::new("a.ftl"), "# header\nhello = Hi\n")
+            .unwrap();
+        let err = definitions
+            .record("en-US", Path::new("b.ftl"), "x = 1\n\nhello = Again\n")
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::DuplicateId { id, lang, first, second }
+                if id == "hello" && lang == "en-US"
+                    && first == &(PathBuf::from("a.ftl"), 2)
+                    && second == &(PathBuf::from("b.ftl"), 3)),
+            "{err:?}"
+        );
+        assert!(
+            err.to_string().contains(
+                "`hello` is defined twice in locale `en-US`: first at a.ftl:2, again at b.ftl:3"
+            ),
+            "{err}"
+        );
     }
 
     #[test]
-    #[should_panic(
-        expected = "`-brand` is defined twice in locale `fr-FR`: first at a.ftl:1, again at a.ftl:2"
-    )]
     fn duplicate_within_one_file_is_rejected() {
-        Definitions::default().record("fr-FR", Path::new("a.ftl"), "-brand = A\n-brand = B\n");
+        let err = Definitions::default()
+            .record("fr-FR", Path::new("a.ftl"), "-brand = A\n-brand = B\n")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains(
+                "`-brand` is defined twice in locale `fr-FR`: first at a.ftl:1, again at a.ftl:2"
+            ),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1547,8 +1843,11 @@ via = Says { v }
     #[test]
     fn fallback_key_is_canonicalised() {
         let builder = FluentZeroBuilder::new("locales").fallback_locale("en-gb");
-        assert_eq!(builder.fallback_key(), "en-GB");
-        assert_eq!(FluentZeroBuilder::new("locales").fallback_key(), "en-US");
+        assert_eq!(builder.fallback_key().unwrap(), "en-GB");
+        assert_eq!(
+            FluentZeroBuilder::new("locales").fallback_key().unwrap(),
+            "en-US"
+        );
     }
 
     #[test]
@@ -1558,20 +1857,46 @@ via = Says { v }
             .map(|l| l.parse().unwrap())
             .collect();
         assert_eq!(check_fallback("en-US", &available), Ok(()));
-        assert_eq!(
-            check_fallback("en-GB", &available),
-            Err("en-US, fr-FR".to_string())
-        );
+        let available = check_fallback("en-GB", &available).unwrap_err();
+        assert_eq!(available, ["en-US", "fr-FR"]);
         // A crate without locales of its own accepts any fallback.
         assert_eq!(check_fallback("en-GB", &[]), Ok(()));
+
+        let err = Error::MissingFallbackLocale {
+            locale: "en-GB".to_string(),
+            locales_dir: PathBuf::from("locales"),
+            available,
+        };
+        assert_eq!(
+            err.to_string(),
+            "fallback locale `en-GB` has no directory in locales (available: en-US, fr-FR)"
+        );
     }
 
     #[test]
-    #[should_panic(expected = "not a valid language identifier")]
-    fn invalid_fallback_is_rejected() {
-        let _ = FluentZeroBuilder::new("locales")
+    fn invalid_fallback_is_an_error_before_anything_is_written() {
+        // Checked before `OUT_DIR`, which unit tests do not have.
+        let err = FluentZeroBuilder::new("locales")
             .fallback_locale("not a locale")
-            .fallback_key();
+            .try_generate()
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidFallbackLocale { locale, .. } if locale == "not a locale"),
+            "{err:?}"
+        );
+        assert!(
+            err.to_string()
+                .starts_with("fallback locale `not a locale` is not a valid language identifier: "),
+            "{err}"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "fluent-zero-build: fallback locale `not a locale` is not a valid")]
+    fn generate_panics_with_the_error_message() {
+        FluentZeroBuilder::new("locales")
+            .fallback_locale("not a locale")
+            .generate();
     }
 
     fn syntax_errors(source: &str) -> String {
@@ -1584,8 +1909,7 @@ via = Says { v }
         let report = syntax_errors("ok = Fine\nbroken Value\n");
         assert_eq!(
             report,
-            "failed to parse locales/en-US/main.ftl:\n\
-             locales/en-US/main.ftl:2:8: Expected a token starting with \"=\"\n\
+            "locales/en-US/main.ftl:2:8: Expected a token starting with \"=\"\n\
              2 | broken Value\n\
              \x20 |        ^"
         );
@@ -1609,16 +1933,22 @@ via = Says { v }
         fs::create_dir_all(&dir).unwrap();
         let file = dir.join("bad.ftl");
         fs::write(&file, "bad Value\n").unwrap();
-        let panic = std::panic::catch_unwind(|| {
-            FluentZeroBuilder::process_locale_dir(&dir, "en-US", &mut BTreeSet::new(), true)
-        })
-        .expect_err("a syntax error must fail the build");
+        let err = FluentZeroBuilder::process_locale_dir(&dir, "en-US", &mut BTreeSet::new(), true)
+            .expect_err("a syntax error must fail the build");
         fs::remove_dir_all(&dir).unwrap();
-        let message = panic.downcast_ref::<String>().expect("formatted panic");
+        let Error::Parse { path, message } = &err else {
+            panic!("expected a parse error, got {err:?}");
+        };
+        assert_eq!(path, &file);
         assert!(
-            message.contains(&format!("{}:1:5: Expected a token", file.display())),
+            message.starts_with(&format!("{}:1:5: Expected a token", file.display())),
             "{message}"
         );
+        assert_eq!(
+            err.to_string(),
+            format!("failed to parse {}:\n{message}", file.display())
+        );
+        assert!(std::error::Error::source(&err).is_none());
     }
 
     fn ids(lang: &str, ids: &[&str]) -> (String, BTreeSet<String>) {
@@ -1670,16 +2000,18 @@ via = Says { v }
         let ids = [ids("en-US", &["a"]), ids("fr", &[])];
         FluentZeroBuilder::default()
             .missing_translations(MissingTranslations::Allow)
-            .check_coverage(&ids);
-        let panic = std::panic::catch_unwind(|| {
-            FluentZeroBuilder::default()
-                .missing_translations(MissingTranslations::Deny)
-                .check_coverage(&ids);
-        })
-        .expect_err("deny must fail the build");
-        let message = panic.downcast_ref::<String>().expect("formatted panic");
+            .check_coverage("en-US", &ids)
+            .unwrap();
+        let err = FluentZeroBuilder::default()
+            .missing_translations(MissingTranslations::Deny)
+            .check_coverage("en-US", &ids)
+            .expect_err("deny must fail the build");
+        assert!(
+            matches!(&err, Error::MissingTranslations { report } if report.len() == 1),
+            "{err:?}"
+        );
         assert_eq!(
-            message,
+            err.to_string(),
             "missing translations:\nfr is missing 1 of 1 messages from en-US: a"
         );
     }
@@ -1691,16 +2023,14 @@ via = Says { v }
             ids("en-GB", &["a"]),
             ids("fr", &[]),
         ];
-        let panic = std::panic::catch_unwind(|| {
-            FluentZeroBuilder::default()
-                .fallback_locale("en-GB")
-                .missing_translations(MissingTranslations::Deny)
-                .check_coverage(&ids);
-        })
-        .expect_err("deny must fail the build");
-        let message = panic.downcast_ref::<String>().expect("formatted panic");
+        let builder = FluentZeroBuilder::default()
+            .fallback_locale("en-GB")
+            .missing_translations(MissingTranslations::Deny);
+        let err = builder
+            .check_coverage(&builder.fallback_key().unwrap(), &ids)
+            .expect_err("deny must fail the build");
         assert_eq!(
-            message,
+            err.to_string(),
             "missing translations:\nfr is missing 1 of 1 messages from en-GB: a"
         );
     }
@@ -1829,7 +2159,8 @@ login = Log in
     #[test]
     fn repeated_attribute_names_keep_the_first() {
         let source = "m = M\n    .a = First\n    .a = Second\n";
-        let generated = static_cache_entries(&"en-US".parse().unwrap(), source, true);
+        let generated =
+            static_cache_entries(DEFAULT_CRATE_PATH, &"en-US".parse().unwrap(), source, true);
         let keys: Vec<&str> = generated.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(keys, ["m", "m.a"]);
         assert_eq!(generated[1].1, static_literal("First"));
@@ -1903,10 +2234,14 @@ n = { NUMBER($count, style: \"percent\") ->
 
     #[test]
     fn number_literals_are_bare_without_isolation() {
-        let entries: HashMap<_, _> =
-            static_cache_entries(&"en-US".parse().unwrap(), "n = Take { 5 } now\n", false)
-                .into_iter()
-                .collect();
+        let entries: HashMap<_, _> = static_cache_entries(
+            DEFAULT_CRATE_PATH,
+            &"en-US".parse().unwrap(),
+            "n = Take { 5 } now\n",
+            false,
+        )
+        .into_iter()
+        .collect();
         assert_eq!(entries["n"], static_literal("Take 5 now"));
     }
 
@@ -1966,12 +2301,13 @@ n = { NUMBER($count, style: \"percent\") ->
         }
         fs::write(dir.join("notes.txt"), "ignored").unwrap();
 
-        let entries = sorted_dir_entries(&dir);
+        let entries = sorted_dir_entries(&dir).unwrap();
         let names: Vec<_> = entries.iter().map(|p| p.file_name().unwrap()).collect();
         assert_eq!(names, ["a.ftl", "b.ftl", "c.ftl", "notes.txt"]);
 
         let source =
-            FluentZeroBuilder::process_locale_dir(&dir, "en-US", &mut BTreeSet::new(), true);
+            FluentZeroBuilder::process_locale_dir(&dir, "en-US", &mut BTreeSet::new(), true)
+                .unwrap();
         assert_eq!(source, "a = a\n\nb = b\n\nc = c\n\n");
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -1981,16 +2317,16 @@ n = { NUMBER($count, style: \"percent\") ->
         let dir = temp_dir("isolation");
         fs::write(dir.join("main.ftl"), "a = Hi { $name }\n").unwrap();
         let mut on = BTreeSet::new();
-        FluentZeroBuilder::process_locale_dir(&dir, "en-US", &mut on, true);
+        FluentZeroBuilder::process_locale_dir(&dir, "en-US", &mut on, true).unwrap();
         assert!(on.contains(&'\u{2068}') && on.contains(&'\u{2069}'));
 
         let mut off = BTreeSet::new();
-        FluentZeroBuilder::process_locale_dir(&dir, "en-US", &mut off, false);
+        FluentZeroBuilder::process_locale_dir(&dir, "en-US", &mut off, false).unwrap();
         assert!(!off.contains(&'\u{2068}') && !off.contains(&'\u{2069}'));
 
         fs::write(dir.join("main.ftl"), "a = { $name }\nb = Plain\n").unwrap();
         let mut single = BTreeSet::new();
-        FluentZeroBuilder::process_locale_dir(&dir, "en-US", &mut single, true);
+        FluentZeroBuilder::process_locale_dir(&dir, "en-US", &mut single, true).unwrap();
         assert!(!single.contains(&'\u{2068}'));
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -2062,5 +2398,90 @@ n = { NUMBER($count, style: \"percent\") ->
             Path::new("/t/debug/build/x/out/../c.txt"),
             out
         ));
+    }
+
+    #[test]
+    fn crate_path_prefixes_cache_entries() {
+        let entries: HashMap<_, _> = static_cache_entries(
+            "::fz",
+            &"en-US".parse().unwrap(),
+            "a = A\nb = { $x }\n",
+            true,
+        )
+        .into_iter()
+        .collect();
+        assert_eq!(entries["a"], r#"::fz::CacheEntry::Static("A")"#);
+        assert_eq!(entries["b"], "::fz::CacheEntry::Dynamic");
+    }
+
+    #[test]
+    fn crate_path_prefixes_generated_items() {
+        let mut out = Vec::new();
+        FluentZeroBuilder::write_bundle_initializer(&mut out, "::fz", "B", "en-US", "a = A", false)
+            .unwrap();
+        FluentZeroBuilder::write_cache_map(&mut out, "::fz", "CACHE_EN_US", &[]).unwrap();
+        FluentZeroBuilder::write_root_maps(&mut out, "::fz", &[], &[]).unwrap();
+        FluentZeroBuilder::write_catalog(&mut out, "::fz", "en-US", &[]).unwrap();
+        FluentZeroBuilder::write_keys(&mut out, &BTreeSet::new(), "en-US", &HashMap::new())
+            .unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(!out.contains("fluent_zero"), "default path leaked: {out}");
+        assert!(out.contains("::fz::__private::ConcurrentFluentBundle"));
+        assert!(out.contains("::fz::__private::phf::Map"));
+        assert!(out.contains("::fz::__private::CatalogLocale"));
+        assert!(out.contains("pub static CATALOG: ::fz::Catalog = ::fz::__private::catalog("));
+    }
+
+    #[test]
+    fn validates_crate_paths() {
+        for ok in ["::fluent_zero", "fz", "crate::reexports::fz", "_fz2"] {
+            assert!(is_rust_path(ok), "{ok:?} should be accepted");
+        }
+        for bad in [
+            "",
+            "::",
+            "fz::",
+            "a::::b",
+            "2fz",
+            "fluent-zero",
+            "_",
+            "fz;",
+            "::a b",
+        ] {
+            assert!(!is_rust_path(bad), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn invalid_crate_path_is_an_error_not_a_panic() {
+        let err = FluentZeroBuilder::new("locales")
+            .crate_path("fluent-zero")
+            .try_generate()
+            .unwrap_err();
+        assert!(matches!(&err, Error::InvalidCratePath(p) if p == "fluent-zero"));
+        assert!(err.to_string().contains("\"fluent-zero\""), "{err}");
+    }
+
+    #[test]
+    fn io_errors_carry_path_and_source() {
+        let err = io_err(Path::new("x/y.ftl"))(io::Error::new(io::ErrorKind::NotFound, "gone"));
+        assert_eq!(
+            err.to_string(),
+            format!("{}: gone", Path::new("x/y.ftl").display())
+        );
+        assert!(std::error::Error::source(&err).is_some());
+    }
+
+    #[test]
+    fn unreadable_locale_dir_is_an_io_error() {
+        let missing = temp_dir("unreadable").join("missing");
+        let err =
+            FluentZeroBuilder::process_locale_dir(&missing, "en-US", &mut BTreeSet::new(), true)
+                .unwrap_err();
+        assert!(
+            matches!(&err, Error::Io { path, .. } if path == &missing),
+            "{err:?}"
+        );
+        fs::remove_dir_all(missing.parent().unwrap()).unwrap();
     }
 }

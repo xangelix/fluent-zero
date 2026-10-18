@@ -6,8 +6,11 @@ use std::{
 
 // Imports
 use fluent_zero::{
-    CacheEntry, CacheStore, ConcurrentFluentBundle, FluentArgs, FluentResource, LanguageIdentifier,
-    LocaleState, lookup_dynamic, lookup_dynamic_in, lookup_static, lookup_static_in, set_lang,
+    __private::{
+        CacheStore, ConcurrentFluentBundle, FluentResource, lookup_dynamic, lookup_dynamic_in,
+        lookup_static, lookup_static_in,
+    },
+    CacheEntry, FluentArgs, LanguageIdentifier, LocaleState, set_lang,
 };
 
 // =========================================================================

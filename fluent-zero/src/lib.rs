@@ -8,17 +8,27 @@
 //! strings. When a string is static (contains no variables), it returns a `&'static str`
 //! reference to the binary's read-only data, avoiding all heap allocations.
 //!
+//! The public API is [`t!`], [`t_in!`], [`set_lang`], [`get_lang`],
+//! [`LocaleState`], [`Catalog`], [`CacheEntry`], [`DEFAULT_FALLBACK`],
+//! [`join_charsets`], the runtime diagnostics ([`set_error_handler`],
+//! [`clear_error_handler`], [`LookupError`], [`FormatErrors`],
+//! [`ErrorHandler`]) and the re-exported [`LanguageIdentifier`] and
+//! [`FluentArgs`]. Everything under `__private` exists only for the code
+//! `fluent-zero-build` generates and the macros; it is not covered by semver
+//! and may change in any release.
+//!
 //! # Example
 //!
 //! ```rust,standalone_crate
 //! # use std::sync::LazyLock;
 //! # use fluent_zero::{
-//! #     BundleCollection, CacheEntry, CacheStore, ConcurrentFluentBundle, FluentResource,
+//! #     CacheEntry,
+//! #     __private::{BundleCollection, CacheStore, ConcurrentFluentBundle, FluentResource},
 //! # };
-//! # // Hand-written stand-ins for the `CACHE` and `LOCALES` statics that
+//! # // Hand-written stand-ins for the `CATALOG` static and the key list that
 //! # // `fluent-zero-build` generates.
-//! # struct Cache;
-//! # impl CacheStore for Cache {
+//! # struct Catalog;
+//! # impl CacheStore for Catalog {
 //! #     fn get_entry(&self, lang: &str, key: &str) -> Option<CacheEntry> {
 //! #         match (lang, key) {
 //! #             ("en-US", "app-title") => Some(CacheEntry::Static("My App")),
@@ -28,7 +38,6 @@
 //! #         }
 //! #     }
 //! # }
-//! # static CACHE: Cache = Cache;
 //! # static EN_US: LazyLock<ConcurrentFluentBundle<FluentResource>> = LazyLock::new(|| {
 //! #     let mut bundle = ConcurrentFluentBundle::new_concurrent(vec!["en-US".parse().unwrap()]);
 //! #     bundle.set_use_isolating(false);
@@ -36,14 +45,14 @@
 //! #     bundle.add_resource(FluentResource::try_new(ftl.into()).unwrap()).unwrap();
 //! #     bundle
 //! # });
-//! # struct Locales;
-//! # impl BundleCollection for Locales {
+//! # impl BundleCollection for Catalog {
 //! #     fn get_bundle(&self, lang: &str) -> Option<&ConcurrentFluentBundle<FluentResource>> {
 //! #         (lang == "en-US").then(|| &*EN_US)
 //! #     }
 //! # }
-//! # static LOCALES: Locales = Locales;
-//! // Brings the generated `CACHE` and `LOCALES` statics into scope.
+//! # static CATALOG: Catalog = Catalog;
+//! # const __FLUENT_ZERO_KEYS: &[&str] = &["app-title", "welcome-user"];
+//! // Brings the generated `CATALOG`, `keys` and key list into scope.
 //! // (Replaced by hand-written stand-ins in this example.)
 //! # /*
 //! include!(concat!(env!("OUT_DIR"), "/static_cache.rs"));
@@ -62,6 +71,7 @@
 //!     // Switching language is global and takes effect immediately.
 //!     set_lang("fr-FR".parse().unwrap());
 //!     assert_eq!(t!("app-title"), "Mon appli");
+//!     assert_eq!(fluent_zero::get_lang().key(), "fr-FR");
 //!
 //!     // Messages missing from fr-FR fall back to en-US.
 //!     let welcome = t!("welcome-user", { "name" => "Bob", "unread_count" => 0 });
@@ -69,23 +79,24 @@
 //! }
 //! ```
 
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+#![deny(rustdoc::broken_intra_doc_links)]
+
 extern crate self as fluent_zero;
 
 use std::{
     borrow::Cow,
-    collections::HashMap,
-    hash::BuildHasher,
     sync::{Arc, LazyLock},
 };
 
 use arc_swap::{ArcSwap, ArcSwapOption};
+use fluent_bundle::FluentError;
 
-pub use fluent_bundle::{
-    FluentArgs, FluentError, FluentResource, concurrent::FluentBundle as ConcurrentFluentBundle,
-};
-pub use fluent_syntax;
-pub use phf;
+pub use fluent_bundle::FluentArgs;
 pub use unic_langid::LanguageIdentifier;
+
+use crate::__private::{BundleCollection, CacheStore, CatalogLocale};
 
 /// Represents the result of a cache lookup from the generated PHF map.
 ///
@@ -99,24 +110,25 @@ pub enum CacheEntry {
     Static(&'static str),
     /// The message is dynamic (contains variables/selectors).
     ///
-    /// This indicates that the system must load the `ConcurrentFluentBundle` to
-    /// resolve the final string.
+    /// This indicates that the system must load the Fluent bundle to resolve
+    /// the final string.
     Dynamic,
 }
 
 /// A language and the locale keys a lookup tries for it.
 ///
-/// The global language set by [`set_lang`] is one of these, and servers that
-/// render for several users at once can build one per user (or request) and
-/// pass it to [`t_in!`], [`lookup_static_in`] or [`lookup_dynamic_in`].
+/// The global language set by [`set_lang`] is one of these (see [`get_lang`]),
+/// and servers that render for several users at once can build one per user
+/// (or request) and pass it to [`t_in!`].
 ///
 /// Building one resolves the fallback chain once (a few small allocations), so
 /// every lookup afterwards just walks a short precomputed slice of keys.
+#[derive(Debug)]
 pub struct LocaleState {
     /// The parsed identifier (e.g., `en-US`).
-    _id: LanguageIdentifier,
+    id: LanguageIdentifier,
     /// The string representation used for cache keys (e.g., "en-US").
-    pub key: String,
+    key: String,
     /// Candidate locale keys, most specific first: the identifier itself, then
     /// with variants, script and region dropped in turn (`sr-Latn-RS` tries
     /// `sr-Latn-RS`, `sr-Latn`, `sr-RS`, `sr`). The bare language is always
@@ -147,14 +159,28 @@ impl LocaleState {
             }
         }
         Self {
-            _id: id,
+            id,
             key,
             chain: chain.into_boxed_slice(),
         }
     }
 
+    /// The language identifier this state was built from (for the global
+    /// language, the one passed to [`set_lang`]; `en-US` by default).
+    #[must_use]
+    pub fn id(&self) -> &LanguageIdentifier {
+        &self.id
+    }
+
+    /// The canonical string form of [`id`](Self::id) (e.g. `"en-US"`), which is
+    /// the first key the generated caches are probed with.
+    #[must_use]
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
     /// The locale keys a lookup tries, most specific first, before the
-    /// store's fallback locale.
+    /// catalog's fallback locale.
     pub fn chain(&self) -> impl ExactSizeIterator<Item = &str> {
         self.chain.iter().map(|key| &**key)
     }
@@ -177,7 +203,7 @@ static CURRENT_LANG: LazyLock<ArcSwap<LocaleState>> = LazyLock::new(|| {
     ArcSwap::from_pointee(LocaleState::new(id))
 });
 
-/// The fallback locale of stores that do not configure one.
+/// The fallback locale of catalogs that do not configure one.
 ///
 /// Generated code exports its own `FALLBACK` (see
 /// `FluentZeroBuilder::fallback_locale`), which defaults to this value.
@@ -198,109 +224,50 @@ pub fn set_lang(lang: LanguageIdentifier) {
 
 /// Retrieves the current language state.
 ///
-/// Returns a guard containing the `Arc<LocaleState>`. This is primarily used
-/// internally by the lookup functions but is exposed for diagnostics.
-pub fn get_lang() -> arc_swap::Guard<std::sync::Arc<LocaleState>> {
-    CURRENT_LANG.load()
+/// The returned `Arc` is a snapshot: a later [`set_lang`] does not change it.
+/// Lookups made by [`t!`] read the language directly and do not go through
+/// this function.
+#[must_use]
+pub fn get_lang() -> Arc<LocaleState> {
+    CURRENT_LANG.load_full()
 }
-
-/// A store that maps `(Locale, Key)` to a `CacheEntry`.
-///
-/// This trait exists to abstract over the generated `phf::Map` and standard `HashMap`s
-/// used in testing.
-pub trait CacheStore: Sync + Send {
-    /// Retrieves a cache entry for a specific language and message key.
-    fn get_entry(&self, lang: &str, key: &str) -> Option<CacheEntry>;
-
-    /// The locale tried after every key of the language's fallback chain.
-    fn fallback_locale(&self) -> &str {
-        DEFAULT_FALLBACK
-    }
-}
-
-// Impl for Generated PHF Map
-impl CacheStore for phf::Map<&'static str, &'static phf::Map<&'static str, CacheEntry>> {
-    fn get_entry(&self, lang: &str, key: &str) -> Option<CacheEntry> {
-        // Single hash on `lang` (usually very small map), then Single hash on `key`.
-        self.get(lang).and_then(|m| m.get(key)).copied()
-    }
-}
-
-/// A collection capable of retrieving a `ConcurrentFluentBundle` by language key.
-pub trait BundleCollection: Sync + Send {
-    /// Retrieves the bundle for the specified language.
-    fn get_bundle(&self, lang: &str) -> Option<&ConcurrentFluentBundle<FluentResource>>;
-}
-
-// Impl for Generated PHF Map
-impl BundleCollection
-    for phf::Map<&'static str, &'static LazyLock<ConcurrentFluentBundle<FluentResource>>>
-{
-    fn get_bundle(&self, lang: &str) -> Option<&ConcurrentFluentBundle<FluentResource>> {
-        self.get(lang).map(|lazy| &***lazy)
-    }
-}
-
-// Impl for HashMap (For Tests)
-impl<S: BuildHasher + Sync + Send> BundleCollection
-    for HashMap<String, ConcurrentFluentBundle<FluentResource>, S>
-{
-    fn get_bundle(&self, lang: &str) -> Option<&ConcurrentFluentBundle<FluentResource>> {
-        self.get(lang)
-    }
-}
-
-/// One locale's tables in a [`Catalog`]: its static cache and its bundle.
-pub type CatalogLocale = (
-    &'static phf::Map<&'static str, CacheEntry>,
-    &'static LazyLock<ConcurrentFluentBundle<FluentResource>>,
-);
 
 /// A crate's generated lookup tables, as used by [`t!`] and [`t_in!`].
 ///
-/// Unlike the plain `CACHE` and `LOCALES` maps, a catalog also answers for the
-/// language-level keys that end a fallback chain (`ru` when only `ru-RU/`
-/// exists, `zh-TW` when only `zh-Hant/` exists), resolved by
-/// `fluent-zero-build` against this crate's own locales. Each entry carries
-/// both tables, so a lookup costs one map probe per candidate key.
+/// `fluent-zero-build` generates one as the `CATALOG` static at the root of
+/// each crate that includes its output. Besides each locale under its own key,
+/// a catalog answers for the language-level keys that end a fallback chain
+/// (`ru` when only `ru-RU/` exists, `zh-TW` when only `zh-Hant/` exists),
+/// resolved by `fluent-zero-build` against this crate's own locales. Each
+/// entry carries both the static cache and the bundle, so a lookup costs one
+/// map probe per candidate key.
 pub struct Catalog {
     fallback: &'static str,
-    locales: &'static phf::Map<&'static str, CatalogLocale>,
+    locales: &'static __private::phf::Map<&'static str, CatalogLocale>,
 }
 
 impl Catalog {
-    /// Creates a catalog. Called by the code `fluent-zero-build` generates.
-    #[must_use]
-    pub const fn new(
-        fallback: &'static str,
-        locales: &'static phf::Map<&'static str, CatalogLocale>,
-    ) -> Self {
-        Self { fallback, locales }
-    }
-
     /// The locale tried when the language's own chain has no message.
     #[must_use]
     pub const fn fallback(&self) -> &'static str {
         self.fallback
     }
-}
 
-impl CacheStore for Catalog {
-    fn get_entry(&self, lang: &str, key: &str) -> Option<CacheEntry> {
-        self.locales
-            .get(lang)
-            .and_then(|(messages, _)| messages.get(key))
-            .copied()
-    }
-
-    fn fallback_locale(&self) -> &str {
-        self.fallback
+    /// Every locale key this catalog answers for, including negotiation
+    /// aliases such as `pt` for `pt-PT`, in no particular order.
+    pub fn locales(&self) -> impl ExactSizeIterator<Item = &'static str> {
+        self.locales.keys().copied()
     }
 }
 
-impl BundleCollection for Catalog {
-    fn get_bundle(&self, lang: &str) -> Option<&ConcurrentFluentBundle<FluentResource>> {
-        self.locales.get(lang).map(|(_, bundle)| &***bundle)
+impl std::fmt::Debug for Catalog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut locales: Vec<&str> = self.locales().collect();
+        locales.sort_unstable();
+        f.debug_struct("Catalog")
+            .field("fallback", &self.fallback)
+            .field("locales", &locales)
+            .finish()
     }
 }
 
@@ -376,7 +343,7 @@ pub enum LookupError<'a> {
         /// The language whose bundle formatted the message.
         lang: &'a str,
         /// The errors reported by `fluent-bundle`.
-        errors: &'a [FluentError],
+        errors: FormatErrors<'a>,
     },
 }
 
@@ -397,9 +364,8 @@ impl std::fmt::Display for LookupError<'_> {
             }
             Self::Format { key, lang, errors } => {
                 write!(f, "failed to format message `{key}` (language {lang})")?;
-                for (i, error) in errors.iter().enumerate() {
-                    f.write_str(if i == 0 { ": " } else { "; " })?;
-                    write!(f, "{error}")?;
+                if !errors.is_empty() {
+                    write!(f, ": {errors}")?;
                 }
                 Ok(())
             }
@@ -408,6 +374,48 @@ impl std::fmt::Display for LookupError<'_> {
 }
 
 impl std::error::Error for LookupError<'_> {}
+
+/// The errors `fluent-bundle` reported while formatting one message, as carried
+/// by [`LookupError::Format`].
+///
+/// Displays as the individual errors joined with `"; "`. The concrete error
+/// type belongs to `fluent-bundle` and is deliberately not exposed, so each
+/// error is offered as a [`std::error::Error`] trait object.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FormatErrors<'a>(&'a [FluentError]);
+
+impl<'a> FormatErrors<'a> {
+    /// The number of errors.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether there are no errors.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Iterates over the errors, in the order `fluent-bundle` reported them.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &'a (dyn std::error::Error + 'static)> {
+        self.0
+            .iter()
+            .map(|error| error as &(dyn std::error::Error + 'static))
+    }
+}
+
+impl std::fmt::Display for FormatErrors<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (i, error) in self.0.iter().enumerate() {
+            if i > 0 {
+                f.write_str("; ")?;
+            }
+            write!(f, "{error}")?;
+        }
+        Ok(())
+    }
+}
 
 /// Signature of a handler installed with [`set_error_handler`].
 pub type ErrorHandler = fn(&LookupError<'_>);
@@ -480,7 +488,7 @@ fn resolve_entry<'a, B: BundleCollection + ?Sized, C: CacheStore + ?Sized>(
                 report(&LookupError::Format {
                     key,
                     lang,
-                    errors: &errors,
+                    errors: FormatErrors(&errors),
                 });
             }
             Some(value)
@@ -520,126 +528,13 @@ fn lookup_core<'a, B: BundleCollection + ?Sized, C: CacheStore + ?Sized>(
     Cow::Borrowed(key)
 }
 
-/// Retrieves a localized message without arguments.
-///
-/// This function attempts to return a `Cow::Borrowed` referencing static binary data
-/// whenever possible to avoid allocation.
-///
-/// # Resolution Order
-///
-/// 1. **Current Language**: Checks each key of the current language's fallback
-///    chain (see [`LocaleState`]), most specific first.
-/// 2. **Fallback Language**: If missing, checks the store's fallback locale
-///    ([`DEFAULT_FALLBACK`] unless the store configures one).
-/// 3. **Missing Key**: Returns the `key` itself wrapped in `Cow::Borrowed` and
-///    reports a [`LookupError::MissingKey`] to the [error handler](set_error_handler).
-///
-/// # Arguments
-///
-/// * `bundles` - The collection of Fluent bundles (usually `crate::LOCALES`).
-/// * `cache` - The static cache map (usually `crate::CACHE`).
-/// * `key` - The message ID to look up, or `message.attribute` for an attribute.
-pub fn lookup_static<'a, B: BundleCollection + ?Sized, C: CacheStore + ?Sized>(
-    bundles: &'a B,
-    cache: &C,
-    key: &'a str,
-) -> Cow<'a, str> {
-    lookup_core(bundles, cache, &get_lang(), key, None)
-}
-
-/// Retrieves a localized message with arguments.
-///
-/// Even when arguments are provided, this function checks if the underlying message
-/// is actually static. If so, it ignores the arguments and returns the static string
-/// to preserve performance.
-///
-/// # Arguments
-///
-/// * `bundles` - The collection of Fluent bundles.
-/// * `cache` - The static cache map.
-/// * `key` - The message ID to look up, or `message.attribute` for an attribute.
-/// * `args` - The arguments to interpolate into the message.
-pub fn lookup_dynamic<'a, B: BundleCollection + ?Sized, C: CacheStore + ?Sized>(
-    bundles: &'a B,
-    cache: &C,
-    key: &'a str,
-    args: &FluentArgs,
-) -> Cow<'a, str> {
-    lookup_core(bundles, cache, &get_lang(), key, Some(args))
-}
-
-/// Like [`lookup_static`], but for `lang` instead of the global language.
-///
-/// For servers and tools rendering for several users at once: build one
-/// [`LocaleState`] per user and pass it here (or to [`t_in!`]).
-pub fn lookup_static_in<'a, B: BundleCollection + ?Sized, C: CacheStore + ?Sized>(
-    lang: &LocaleState,
-    bundles: &'a B,
-    cache: &C,
-    key: &'a str,
-) -> Cow<'a, str> {
-    lookup_core(bundles, cache, lang, key, None)
-}
-
-/// Like [`lookup_dynamic`], but for `lang` instead of the global language.
-pub fn lookup_dynamic_in<'a, B: BundleCollection + ?Sized, C: CacheStore + ?Sized>(
-    lang: &LocaleState,
-    bundles: &'a B,
-    cache: &C,
-    key: &'a str,
-    args: &FluentArgs,
-) -> Cow<'a, str> {
-    lookup_core(bundles, cache, lang, key, Some(args))
-}
-
-/// Returns whether `key` is in `sorted_keys`, which must be sorted by byte
-/// order (as the generated `__FLUENT_ZERO_KEYS` is).
-///
-/// Support for `t!`: it runs in a `const` block, so a binary search keeps the
-/// compile-time cost of each `t!` call logarithmic in the number of keys.
-#[doc(hidden)]
-#[must_use]
-pub const fn __key_exists(sorted_keys: &[&str], key: &str) -> bool {
-    let (mut low, mut high) = (0, sorted_keys.len());
-    while low < high {
-        let mid = low + (high - low) / 2;
-        match const_str_cmp(sorted_keys[mid], key) {
-            std::cmp::Ordering::Equal => return true,
-            std::cmp::Ordering::Less => low = mid + 1,
-            std::cmp::Ordering::Greater => high = mid,
-        }
-    }
-    false
-}
-
-/// `Ord for str` (byte-wise lexicographic), usable in `const` contexts.
-const fn const_str_cmp(a: &str, b: &str) -> std::cmp::Ordering {
-    let (a, b) = (a.as_bytes(), b.as_bytes());
-    let mut i = 0;
-    while i < a.len() && i < b.len() {
-        if a[i] != b[i] {
-            return if a[i] < b[i] {
-                std::cmp::Ordering::Less
-            } else {
-                std::cmp::Ordering::Greater
-            };
-        }
-        i += 1;
-    }
-    if a.len() < b.len() {
-        std::cmp::Ordering::Less
-    } else if a.len() > b.len() {
-        std::cmp::Ordering::Greater
-    } else {
-        std::cmp::Ordering::Equal
-    }
-}
-
 /// The primary accessor macro for localized strings.
 ///
-/// It delegates to `lookup_static` or `lookup_dynamic` depending on whether arguments
-/// are provided, using the crate's generated `CATALOG` (which carries its
-/// configured fallback locale and its locale negotiation aliases).
+/// It looks the key up in the active language (see [`set_lang`]) using the
+/// crate's generated `CATALOG` (which carries its configured fallback locale
+/// and its locale negotiation aliases). Without arguments it returns
+/// `Cow::Borrowed` for static messages; with arguments the message is
+/// formatted with them (static messages still return without allocating).
 ///
 /// # Compile-time key checking
 ///
@@ -652,20 +547,22 @@ const fn const_str_cmp(a: &str, b: &str) -> std::cmp::Ordering {
 /// by the compiler simply by existing. To pass a key that is deliberately not
 /// defined in any locale, bind it to a variable or constant first.
 ///
-/// The macro resolves `crate::LOCALES` and `crate::CACHE`, so the crate calling
-/// it must `include!` the file generated by `fluent-zero-build` at its root.
+/// The macro resolves `crate::CATALOG` and `crate::__FLUENT_ZERO_KEYS`, so the
+/// crate calling it must `include!` the file generated by `fluent-zero-build`
+/// at its root.
 ///
 /// # Examples
 ///
 /// ```rust,standalone_crate
 /// # use std::sync::LazyLock;
 /// # use fluent_zero::{
-/// #     BundleCollection, CacheEntry, CacheStore, ConcurrentFluentBundle, FluentResource,
+/// #     CacheEntry,
+/// #     __private::{BundleCollection, CacheStore, ConcurrentFluentBundle, FluentResource},
 /// # };
-/// # // Hand-written stand-ins for the `CACHE` and `LOCALES` statics that
+/// # // Hand-written stand-ins for the `CATALOG` static and the key list that
 /// # // `fluent-zero-build` generates.
-/// # struct Cache;
-/// # impl CacheStore for Cache {
+/// # struct Catalog;
+/// # impl CacheStore for Catalog {
 /// #     fn get_entry(&self, lang: &str, key: &str) -> Option<CacheEntry> {
 /// #         match (lang, key) {
 /// #             ("en-US", "app-title") => Some(CacheEntry::Static("My App")),
@@ -676,7 +573,6 @@ const fn const_str_cmp(a: &str, b: &str) -> std::cmp::Ordering {
 /// #         }
 /// #     }
 /// # }
-/// # static CACHE: Cache = Cache;
 /// # static EN_US: LazyLock<ConcurrentFluentBundle<FluentResource>> = LazyLock::new(|| {
 /// #     let mut bundle = ConcurrentFluentBundle::new_concurrent(vec!["en-US".parse().unwrap()]);
 /// #     bundle.set_use_isolating(false);
@@ -684,13 +580,13 @@ const fn const_str_cmp(a: &str, b: &str) -> std::cmp::Ordering {
 /// #     bundle.add_resource(FluentResource::try_new(ftl.into()).unwrap()).unwrap();
 /// #     bundle
 /// # });
-/// # struct Locales;
-/// # impl BundleCollection for Locales {
+/// # impl BundleCollection for Catalog {
 /// #     fn get_bundle(&self, lang: &str) -> Option<&ConcurrentFluentBundle<FluentResource>> {
 /// #         (lang == "en-US").then(|| &*EN_US)
 /// #     }
 /// # }
-/// # static LOCALES: Locales = Locales;
+/// # static CATALOG: Catalog = Catalog;
+/// # const __FLUENT_ZERO_KEYS: &[&str] = &["app-title", "login.tooltip", "welcome-user"];
 /// use fluent_zero::t;
 ///
 /// # fn main() {
@@ -709,8 +605,10 @@ const fn const_str_cmp(a: &str, b: &str) -> std::cmp::Ordering {
 /// let tooltip = t!("login.tooltip");
 /// assert_eq!(tooltip, "Sign in to your account");
 ///
-/// // A missing key returns the key itself.
-/// assert_eq!(t!("no-such-message"), "no-such-message");
+/// // A missing key returns the key itself. (A literal unknown key would not
+/// // compile, so it goes through a variable.)
+/// let missing = "no-such-message";
+/// assert_eq!(t!(missing), "no-such-message");
 /// # }
 /// ```
 #[allow(clippy::crate_in_macro_def)]
@@ -718,24 +616,24 @@ const fn const_str_cmp(a: &str, b: &str) -> std::cmp::Ordering {
 macro_rules! t {
     ($key:literal) => {{
         const _: () = ::core::assert!(
-            $crate::__key_exists(crate::__FLUENT_ZERO_KEYS, $key),
+            $crate::__private::key_exists(crate::__FLUENT_ZERO_KEYS, $key),
             "{}",
             ::core::concat!("unknown Fluent message key passed to `t!`: ", $key)
         );
-        $crate::lookup_static(&crate::CATALOG, &crate::CATALOG, $key)
+        $crate::__private::lookup_static(&crate::CATALOG, &crate::CATALOG, $key)
     }};
     ($key:literal, { $($k:expr => $v:expr),* $(,)? }) => {{
         const _: () = ::core::assert!(
-            $crate::__key_exists(crate::__FLUENT_ZERO_KEYS, $key),
+            $crate::__private::key_exists(crate::__FLUENT_ZERO_KEYS, $key),
             "{}",
             ::core::concat!("unknown Fluent message key passed to `t!`: ", $key)
         );
         let mut args = $crate::FluentArgs::new();
         $( args.set($k, $v); )*
-        $crate::lookup_dynamic(&crate::CATALOG, &crate::CATALOG, $key, &args)
+        $crate::__private::lookup_dynamic(&crate::CATALOG, &crate::CATALOG, $key, &args)
     }};
     ($key:expr) => {
-        $crate::lookup_static(
+        $crate::__private::lookup_static(
             &crate::CATALOG,
             &crate::CATALOG,
             $key
@@ -745,7 +643,7 @@ macro_rules! t {
         {
             let mut args = $crate::FluentArgs::new();
             $( args.set($k, $v); )*
-            $crate::lookup_dynamic(
+            $crate::__private::lookup_dynamic(
                 &crate::CATALOG,
                 &crate::CATALOG,
                 $key,
@@ -774,24 +672,24 @@ macro_rules! t {
 macro_rules! t_in {
     ($lang:expr, $key:literal) => {{
         const _: () = ::core::assert!(
-            $crate::__key_exists(crate::__FLUENT_ZERO_KEYS, $key),
+            $crate::__private::key_exists(crate::__FLUENT_ZERO_KEYS, $key),
             "{}",
             ::core::concat!("unknown Fluent message key passed to `t_in!`: ", $key)
         );
-        $crate::lookup_static_in($lang, &crate::CATALOG, &crate::CATALOG, $key)
+        $crate::__private::lookup_static_in($lang, &crate::CATALOG, &crate::CATALOG, $key)
     }};
     ($lang:expr, $key:literal, { $($k:expr => $v:expr),* $(,)? }) => {{
         const _: () = ::core::assert!(
-            $crate::__key_exists(crate::__FLUENT_ZERO_KEYS, $key),
+            $crate::__private::key_exists(crate::__FLUENT_ZERO_KEYS, $key),
             "{}",
             ::core::concat!("unknown Fluent message key passed to `t_in!`: ", $key)
         );
         let mut args = $crate::FluentArgs::new();
         $( args.set($k, $v); )*
-        $crate::lookup_dynamic_in($lang, &crate::CATALOG, &crate::CATALOG, $key, &args)
+        $crate::__private::lookup_dynamic_in($lang, &crate::CATALOG, &crate::CATALOG, $key, &args)
     }};
     ($lang:expr, $key:expr) => {
-        $crate::lookup_static_in(
+        $crate::__private::lookup_static_in(
             $lang,
             &crate::CATALOG,
             &crate::CATALOG,
@@ -802,7 +700,7 @@ macro_rules! t_in {
         {
             let mut args = $crate::FluentArgs::new();
             $( args.set($k, $v); )*
-            $crate::lookup_dynamic_in(
+            $crate::__private::lookup_dynamic_in(
                 $lang,
                 &crate::CATALOG,
                 &crate::CATALOG,
@@ -813,9 +711,241 @@ macro_rules! t_in {
     };
 }
 
+/// Support for the macros and the code generated by `fluent-zero-build`.
+///
+/// Not part of the public API: nothing here is covered by semver.
+#[doc(hidden)]
+pub mod __private {
+    use std::{borrow::Cow, collections::HashMap, hash::BuildHasher, sync::LazyLock};
+
+    pub use fluent_bundle::{FluentResource, concurrent::FluentBundle as ConcurrentFluentBundle};
+    pub use phf;
+
+    use crate::{CacheEntry, Catalog, DEFAULT_FALLBACK, FluentArgs, LocaleState};
+
+    /// The contract version between generated code and this runtime.
+    ///
+    /// `fluent-zero-build` embeds the version it generates for into its output as
+    /// `const _: () = <crate>::__private::assert_codegen_version(N);`, so a
+    /// mismatched pair of crates fails to compile with a readable message instead
+    /// of an unresolved path. It is a plain counter, independent of the crates'
+    /// semver versions: bump it (in both crates, to the same value) whenever the
+    /// generated code starts relying on anything in this module that older
+    /// runtimes lack, or stops being accepted by newer ones.
+    pub const CODEGEN_VERSION: u32 = 1;
+
+    /// Fails const evaluation (a compile error in the calling crate) unless
+    /// `generated` equals [`CODEGEN_VERSION`].
+    ///
+    /// # Panics
+    ///
+    /// Panics when the versions differ; in the generated `const` that is a
+    /// compile-time error, never a runtime panic.
+    pub const fn assert_codegen_version(generated: u32) {
+        if generated > CODEGEN_VERSION {
+            panic!(
+                "fluent-zero is older than the fluent-zero-build that generated this code: \
+                 upgrade fluent-zero to the release matching fluent-zero-build"
+            );
+        } else if generated < CODEGEN_VERSION {
+            panic!(
+                "fluent-zero-build is older than the fluent-zero runtime it generated code for: \
+                 upgrade fluent-zero-build to the release matching fluent-zero"
+            );
+        }
+    }
+
+    /// A store that maps `(Locale, Key)` to a `CacheEntry`.
+    ///
+    /// This trait exists to abstract over the generated `phf::Map` and standard `HashMap`s
+    /// used in testing.
+    pub trait CacheStore: Sync + Send {
+        /// Retrieves a cache entry for a specific language and message key.
+        fn get_entry(&self, lang: &str, key: &str) -> Option<CacheEntry>;
+
+        /// The locale tried after every key of the language's fallback chain.
+        fn fallback_locale(&self) -> &str {
+            DEFAULT_FALLBACK
+        }
+    }
+
+    // Impl for Generated PHF Map
+    impl CacheStore for phf::Map<&'static str, &'static phf::Map<&'static str, CacheEntry>> {
+        fn get_entry(&self, lang: &str, key: &str) -> Option<CacheEntry> {
+            // Single hash on `lang` (usually very small map), then Single hash on `key`.
+            self.get(lang).and_then(|m| m.get(key)).copied()
+        }
+    }
+
+    /// A collection capable of retrieving a `ConcurrentFluentBundle` by language key.
+    pub trait BundleCollection: Sync + Send {
+        /// Retrieves the bundle for the specified language.
+        fn get_bundle(&self, lang: &str) -> Option<&ConcurrentFluentBundle<FluentResource>>;
+    }
+
+    // Impl for Generated PHF Map
+    impl BundleCollection
+        for phf::Map<&'static str, &'static LazyLock<ConcurrentFluentBundle<FluentResource>>>
+    {
+        fn get_bundle(&self, lang: &str) -> Option<&ConcurrentFluentBundle<FluentResource>> {
+            self.get(lang).map(|lazy| &***lazy)
+        }
+    }
+
+    // Impl for HashMap (For Tests)
+    impl<S: BuildHasher + Sync + Send> BundleCollection
+        for HashMap<String, ConcurrentFluentBundle<FluentResource>, S>
+    {
+        fn get_bundle(&self, lang: &str) -> Option<&ConcurrentFluentBundle<FluentResource>> {
+            self.get(lang)
+        }
+    }
+
+    /// One locale's tables in a [`Catalog`]: its static cache and its bundle.
+    pub type CatalogLocale = (
+        &'static phf::Map<&'static str, CacheEntry>,
+        &'static LazyLock<ConcurrentFluentBundle<FluentResource>>,
+    );
+
+    /// Creates a [`Catalog`]. Called by the code `fluent-zero-build` generates.
+    #[must_use]
+    pub const fn catalog(
+        fallback: &'static str,
+        locales: &'static phf::Map<&'static str, CatalogLocale>,
+    ) -> Catalog {
+        Catalog { fallback, locales }
+    }
+
+    impl CacheStore for Catalog {
+        fn get_entry(&self, lang: &str, key: &str) -> Option<CacheEntry> {
+            self.locales
+                .get(lang)
+                .and_then(|(messages, _)| messages.get(key))
+                .copied()
+        }
+
+        fn fallback_locale(&self) -> &str {
+            self.fallback
+        }
+    }
+
+    impl BundleCollection for Catalog {
+        fn get_bundle(&self, lang: &str) -> Option<&ConcurrentFluentBundle<FluentResource>> {
+            self.locales.get(lang).map(|(_, bundle)| &***bundle)
+        }
+    }
+
+    /// Retrieves a localized message without arguments, in the global language.
+    ///
+    /// This function attempts to return a `Cow::Borrowed` referencing static binary data
+    /// whenever possible to avoid allocation.
+    ///
+    /// # Resolution Order
+    ///
+    /// 1. **Current Language**: Checks each key of the current language's fallback
+    ///    chain (see [`LocaleState`]), most specific first.
+    /// 2. **Fallback Language**: If missing, checks the store's fallback locale
+    ///    ([`DEFAULT_FALLBACK`] unless the store configures one).
+    /// 3. **Missing Key**: Returns the `key` itself wrapped in `Cow::Borrowed` and
+    ///    reports a [`LookupError::MissingKey`](crate::LookupError::MissingKey) to
+    ///    the [error handler](crate::set_error_handler).
+    pub fn lookup_static<'a, B: BundleCollection + ?Sized, C: CacheStore + ?Sized>(
+        bundles: &'a B,
+        cache: &C,
+        key: &'a str,
+    ) -> Cow<'a, str> {
+        // A borrowed guard, not `get_lang()`: avoids a refcount round trip per lookup.
+        super::lookup_core(bundles, cache, &super::CURRENT_LANG.load(), key, None)
+    }
+
+    /// Retrieves a localized message with arguments, in the global language.
+    ///
+    /// Even when arguments are provided, this function checks if the underlying message
+    /// is actually static. If so, it ignores the arguments and returns the static string
+    /// to preserve performance.
+    pub fn lookup_dynamic<'a, B: BundleCollection + ?Sized, C: CacheStore + ?Sized>(
+        bundles: &'a B,
+        cache: &C,
+        key: &'a str,
+        args: &FluentArgs,
+    ) -> Cow<'a, str> {
+        super::lookup_core(bundles, cache, &super::CURRENT_LANG.load(), key, Some(args))
+    }
+
+    /// Like [`lookup_static`], but for `lang` instead of the global language.
+    pub fn lookup_static_in<'a, B: BundleCollection + ?Sized, C: CacheStore + ?Sized>(
+        lang: &LocaleState,
+        bundles: &'a B,
+        cache: &C,
+        key: &'a str,
+    ) -> Cow<'a, str> {
+        super::lookup_core(bundles, cache, lang, key, None)
+    }
+
+    /// Like [`lookup_dynamic`], but for `lang` instead of the global language.
+    pub fn lookup_dynamic_in<'a, B: BundleCollection + ?Sized, C: CacheStore + ?Sized>(
+        lang: &LocaleState,
+        bundles: &'a B,
+        cache: &C,
+        key: &'a str,
+        args: &FluentArgs,
+    ) -> Cow<'a, str> {
+        super::lookup_core(bundles, cache, lang, key, Some(args))
+    }
+
+    /// Returns whether `key` is in `sorted_keys`, which must be sorted by byte
+    /// order (as the generated `__FLUENT_ZERO_KEYS` is).
+    ///
+    /// Support for `t!`: it runs in a `const` block, so a binary search keeps the
+    /// compile-time cost of each `t!` call logarithmic in the number of keys.
+    #[must_use]
+    pub const fn key_exists(sorted_keys: &[&str], key: &str) -> bool {
+        let (mut low, mut high) = (0, sorted_keys.len());
+        while low < high {
+            let mid = low + (high - low) / 2;
+            match const_str_cmp(sorted_keys[mid], key) {
+                std::cmp::Ordering::Equal => return true,
+                std::cmp::Ordering::Less => low = mid + 1,
+                std::cmp::Ordering::Greater => high = mid,
+            }
+        }
+        false
+    }
+
+    /// `Ord for str` (byte-wise lexicographic), usable in `const` contexts.
+    const fn const_str_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+        let (a, b) = (a.as_bytes(), b.as_bytes());
+        let mut i = 0;
+        while i < a.len() && i < b.len() {
+            if a[i] != b[i] {
+                return if a[i] < b[i] {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Greater
+                };
+            }
+            i += 1;
+        }
+        if a.len() < b.len() {
+            std::cmp::Ordering::Less
+        } else if a.len() > b.len() {
+            std::cmp::Ordering::Greater
+        } else {
+            std::cmp::Ordering::Equal
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::collections::HashMap;
+
+    use super::{
+        __private::{
+            ConcurrentFluentBundle, FluentResource, catalog, lookup_dynamic_in, lookup_static_in,
+        },
+        *,
+    };
 
     fn lang(tag: &str) -> LocaleState {
         LocaleState::new(tag.parse().unwrap())
@@ -825,11 +955,23 @@ mod tests {
         lang(tag).chain().map(str::to_owned).collect()
     }
 
+    // The only test that touches the global language, so its assertions about
+    // the default cannot race with another test's `set_lang`.
     #[test]
-    fn default_fallback_is_a_valid_tag() {
+    fn global_language_defaults_to_the_fallback_and_snapshots() {
         let id: LanguageIdentifier = DEFAULT_FALLBACK.parse().unwrap();
         assert_eq!(id.to_string(), "en-US");
-        assert_eq!(get_lang().key, DEFAULT_FALLBACK);
+        assert_eq!(get_lang().key(), DEFAULT_FALLBACK);
+
+        set_lang("fr-FR".parse().unwrap());
+        let state = get_lang();
+        assert_eq!(state.id(), &"fr-FR".parse::<LanguageIdentifier>().unwrap());
+        assert_eq!(state.key(), "fr-FR");
+
+        // The returned Arc is a snapshot that outlives later switches.
+        set_lang("de".parse().unwrap());
+        assert_eq!(state.key(), "fr-FR");
+        assert_eq!(get_lang().key(), "de");
     }
 
     #[test]
@@ -873,7 +1015,7 @@ mod tests {
         "pt-PT" => (&CACHE_PT_PT, &BUNDLE_PT_PT),
         "pt" => (&CACHE_PT_PT, &BUNDLE_PT_PT),
     };
-    static CATALOG: Catalog = Catalog::new("en-GB", &CATALOG_LOCALES);
+    static CATALOG: Catalog = catalog("en-GB", &CATALOG_LOCALES);
 
     fn t_in(tag: &str, key: &'static str) -> Cow<'static, str> {
         lookup_static_in(&lang(tag), &CATALOG, &CATALOG, key)
@@ -905,6 +1047,17 @@ mod tests {
     }
 
     #[test]
+    fn catalog_lists_its_locales_and_aliases() {
+        let mut locales: Vec<&str> = CATALOG.locales().collect();
+        locales.sort_unstable();
+        assert_eq!(locales, ["en", "en-GB", "pt", "pt-PT"]);
+        assert_eq!(
+            format!("{CATALOG:?}"),
+            r#"Catalog { fallback: "en-GB", locales: ["en", "en-GB", "pt", "pt-PT"] }"#
+        );
+    }
+
+    #[test]
     fn stores_without_a_fallback_use_the_default() {
         struct Empty;
         impl CacheStore for Empty {
@@ -915,5 +1068,45 @@ mod tests {
         let store: HashMap<String, ConcurrentFluentBundle<FluentResource>> = HashMap::new();
         assert_eq!(Empty.fallback_locale(), DEFAULT_FALLBACK);
         assert_eq!(lookup_static_in(&lang("fr"), &store, &Empty, "k"), "k");
+    }
+
+    #[test]
+    fn format_errors_display_and_iterate_without_exposing_their_type() {
+        let mut errors = Vec::new();
+        let bundle = bundle("en-US", "m = { $a } { $b }");
+        let pattern = bundle.get_message("m").unwrap().value().unwrap();
+        bundle.format_pattern(pattern, None, &mut errors);
+        let errors = FormatErrors(&errors);
+        assert_eq!(errors.len(), 2);
+        assert!(!errors.is_empty());
+        let messages: Vec<String> = errors.iter().map(ToString::to_string).collect();
+        assert_eq!(errors.to_string(), messages.join("; "));
+
+        let error = LookupError::Format {
+            key: "m",
+            lang: "en-US",
+            errors,
+        };
+        assert_eq!(
+            error.to_string(),
+            format!("failed to format message `m` (language en-US): {errors}")
+        );
+    }
+
+    #[test]
+    fn matching_codegen_version_is_accepted() {
+        const _: () = __private::assert_codegen_version(__private::CODEGEN_VERSION);
+    }
+
+    #[test]
+    #[should_panic(expected = "upgrade fluent-zero to the release matching fluent-zero-build")]
+    fn newer_codegen_version_is_rejected() {
+        __private::assert_codegen_version(__private::CODEGEN_VERSION + 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "upgrade fluent-zero-build to the release matching fluent-zero")]
+    fn older_codegen_version_is_rejected() {
+        __private::assert_codegen_version(__private::CODEGEN_VERSION - 1);
     }
 }

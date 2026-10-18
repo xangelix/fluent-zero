@@ -48,11 +48,14 @@ fn key_list_is_the_sorted_union_of_every_locale() {
     assert_eq!(__FLUENT_ZERO_KEYS, union.into_iter().collect::<Vec<_>>());
     assert!(__FLUENT_ZERO_KEYS.is_sorted());
     for key in __FLUENT_ZERO_KEYS {
-        assert!(fluent_zero::__key_exists(__FLUENT_ZERO_KEYS, key), "{key}");
+        assert!(
+            fluent_zero::__private::key_exists(__FLUENT_ZERO_KEYS, key),
+            "{key}"
+        );
     }
     for missing in ["", "a", "plai", "plainx", "zzz"] {
         assert!(
-            !fluent_zero::__key_exists(__FLUENT_ZERO_KEYS, missing),
+            !fluent_zero::__private::key_exists(__FLUENT_ZERO_KEYS, missing),
             "{missing}"
         );
     }
