@@ -130,8 +130,12 @@ impl FluentZeroBuilder {
                 let cache_name = format!("CACHE_{sanitized_lang}");
                 let bundle_name = format!("BUNDLE_{sanitized_lang}");
 
-                let combined_ftl_source =
-                    Self::process_locale_dir(&path, &mut unique_chars, self.use_isolating);
+                let combined_ftl_source = Self::process_locale_dir(
+                    &path,
+                    &lang_key,
+                    &mut unique_chars,
+                    self.use_isolating,
+                );
                 let cache_entries =
                     static_cache_entries(&lang_id, &combined_ftl_source, self.use_isolating);
 
@@ -163,10 +167,12 @@ impl FluentZeroBuilder {
 
     fn process_locale_dir(
         path: &Path,
+        lang_key: &str,
         unique_chars: &mut BTreeSet<char>,
         use_isolating: bool,
     ) -> String {
         let mut combined_ftl_source = String::new();
+        let mut definitions = Definitions::default();
         let mut emits_isolation_marks = false;
 
         for file_path in sorted_dir_entries(path) {
@@ -177,6 +183,7 @@ impl FluentZeroBuilder {
                 combined_ftl_source.push_str(&source);
                 combined_ftl_source.push('\n');
 
+                definitions.record(lang_key, &file_path, &source);
                 let ast = parser::parse(source).expect("Failed to parse FTL");
                 for entry in ast.body {
                     match entry {
@@ -220,13 +227,22 @@ impl FluentZeroBuilder {
         } else {
             "\x20   bundle.set_use_isolating(false);\n"
         };
+        // This runs once per locale, on its first dynamic lookup, so it must
+        // never panic. Each fallible step below was already proven to succeed
+        // at build time, so the fallbacks are unreachable and exist only to
+        // keep panics out of consumers' binaries:
+        // - `lang_key` is the `Display` of a parsed `LanguageIdentifier`,
+        //   which always parses back.
+        // - Every file was parsed without errors in `process_locale_dir`.
+        // - Duplicate IDs were rejected there too, the only way adding a
+        //   resource can fail; overriding makes that infallible by signature.
         let init_code = format!(
             "std::sync::LazyLock::new(|| {{\n\
-            \x20   let lang: ::fluent_zero::LanguageIdentifier = \"{lang_key}\".parse().unwrap();\n\
+            \x20   let lang: ::fluent_zero::LanguageIdentifier = \"{lang_key}\".parse().unwrap_or_default();\n\
             \x20   let mut bundle = ::fluent_zero::ConcurrentFluentBundle::new_concurrent(vec![lang]);\n\
             {isolating_code}\
-            \x20   let res = ::fluent_zero::FluentResource::try_new({escaped_ftl}.to_string()).expect(\"FTL Error\");\n\
-            \x20   bundle.add_resource(res).expect(\"Resource Error\");\n\
+            \x20   let res = ::fluent_zero::FluentResource::try_new({escaped_ftl}.to_string()).unwrap_or_else(|(res, _)| res);\n\
+            \x20   bundle.add_resource_overriding(res);\n\
             \x20   bundle\n\
             }})"
         );
@@ -321,6 +337,59 @@ impl FluentZeroBuilder {
             println!("cargo:rerun-if-changed={}", charset_dest.display());
         }
     }
+}
+
+/// Where each message and term of one locale is defined, to reject duplicates.
+///
+/// Every file of a locale is merged into a single `FluentBundle`, which
+/// refuses a second definition of the same ID. Catching it here turns what
+/// would be a runtime failure into a build error that names both locations.
+#[derive(Default)]
+struct Definitions {
+    /// Keyed by the ID as written, so terms keep their `-` prefix and live in
+    /// their own namespace, exactly as Fluent treats them.
+    locations: HashMap<String, (PathBuf, usize)>,
+}
+
+impl Definitions {
+    /// Records every entry defined in `source`.
+    ///
+    /// # Panics
+    ///
+    /// Panics with both locations when an ID is already defined in this locale.
+    fn record(&mut self, lang_key: &str, file: &Path, source: &str) {
+        for (id, line) in entry_definitions(source) {
+            if let Some((first_file, first_line)) = self.locations.get(id) {
+                panic!(
+                    "fluent-zero-build: `{id}` is defined twice in locale `{lang_key}`: \
+                     first at {}:{first_line}, again at {}:{line}. \
+                     Fluent bundles allow one definition per ID; rename or remove one.",
+                    first_file.display(),
+                    file.display(),
+                );
+            }
+            self.locations
+                .insert(id.to_string(), (file.to_path_buf(), line));
+        }
+    }
+}
+
+/// Yields `(id, 1-based line)` for every message and term in `source`.
+///
+/// In Fluent syntax an entry can only start at column 0 with an identifier
+/// (`-` for terms) followed by `=`: continuation lines must be indented and
+/// comments start with `#`, so this line scan finds exactly the entries the
+/// parser does, plus the line numbers its AST does not carry.
+fn entry_definitions(source: &str) -> impl Iterator<Item = (&str, usize)> {
+    source.lines().enumerate().filter_map(|(index, line)| {
+        let (head, _) = line.split_once('=')?;
+        let id = head.trim_end();
+        let name = id.strip_prefix('-').unwrap_or(id);
+        let mut chars = name.chars();
+        let valid = chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+        valid.then_some((id, index + 1))
+    })
 }
 
 /// Builds the `(message id, CacheEntry expression)` pairs for one locale.
@@ -731,6 +800,47 @@ mod tests {
     const DYNAMIC: &str = "::fluent_zero::CacheEntry::Dynamic";
 
     #[test]
+    fn finds_entry_definitions_with_line_numbers() {
+        let source = "\
+# comment = not an entry
+hello = Hi
+    continued = not an entry
+-brand=Acme
+
+multi =
+    .attr = x
+bad id = not an entry
+";
+        let found: Vec<_> = entry_definitions(source).collect();
+        assert_eq!(found, [("hello", 2), ("-brand", 4), ("multi", 6)]);
+    }
+
+    #[test]
+    fn terms_and_messages_have_separate_namespaces() {
+        let mut definitions = Definitions::default();
+        definitions.record("en-US", Path::new("a.ftl"), "brand = Message\n");
+        definitions.record("en-US", Path::new("b.ftl"), "-brand = Term\n");
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "`hello` is defined twice in locale `en-US`: first at a.ftl:2, again at b.ftl:3"
+    )]
+    fn duplicate_across_files_names_both_locations() {
+        let mut definitions = Definitions::default();
+        definitions.record("en-US", Path::new("a.ftl"), "# header\nhello = Hi\n");
+        definitions.record("en-US", Path::new("b.ftl"), "x = 1\n\nhello = Again\n");
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "`-brand` is defined twice in locale `fr-FR`: first at a.ftl:1, again at a.ftl:2"
+    )]
+    fn duplicate_within_one_file_is_rejected() {
+        Definitions::default().record("fr-FR", Path::new("a.ftl"), "-brand = A\n-brand = B\n");
+    }
+
+    #[test]
     fn plain_text_is_static() {
         assert_eq!(entries("a = Hello\n")["a"], static_literal("Hello"));
     }
@@ -961,7 +1071,8 @@ n = { NUMBER($count, style: \"percent\") ->
         let names: Vec<_> = entries.iter().map(|p| p.file_name().unwrap()).collect();
         assert_eq!(names, ["a.ftl", "b.ftl", "c.ftl", "notes.txt"]);
 
-        let source = FluentZeroBuilder::process_locale_dir(&dir, &mut BTreeSet::new(), true);
+        let source =
+            FluentZeroBuilder::process_locale_dir(&dir, "en-US", &mut BTreeSet::new(), true);
         assert_eq!(source, "a = a\n\nb = b\n\nc = c\n\n");
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -971,16 +1082,16 @@ n = { NUMBER($count, style: \"percent\") ->
         let dir = temp_dir("isolation");
         fs::write(dir.join("main.ftl"), "a = Hi { $name }\n").unwrap();
         let mut on = BTreeSet::new();
-        FluentZeroBuilder::process_locale_dir(&dir, &mut on, true);
+        FluentZeroBuilder::process_locale_dir(&dir, "en-US", &mut on, true);
         assert!(on.contains(&'\u{2068}') && on.contains(&'\u{2069}'));
 
         let mut off = BTreeSet::new();
-        FluentZeroBuilder::process_locale_dir(&dir, &mut off, false);
+        FluentZeroBuilder::process_locale_dir(&dir, "en-US", &mut off, false);
         assert!(!off.contains(&'\u{2068}') && !off.contains(&'\u{2069}'));
 
         fs::write(dir.join("main.ftl"), "a = { $name }\nb = Plain\n").unwrap();
         let mut single = BTreeSet::new();
-        FluentZeroBuilder::process_locale_dir(&dir, &mut single, true);
+        FluentZeroBuilder::process_locale_dir(&dir, "en-US", &mut single, true);
         assert!(!single.contains(&'\u{2068}'));
         fs::remove_dir_all(&dir).unwrap();
     }

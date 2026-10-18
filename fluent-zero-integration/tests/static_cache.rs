@@ -75,3 +75,29 @@ fn messages_with_arguments_stay_dynamic() {
         "\u{2068}3\u{2069} files"
     );
 }
+
+#[test]
+fn generated_code_has_no_panic_paths() {
+    let outputs = [
+        include_str!(concat!(env!("OUT_DIR"), "/static_cache.rs")),
+        include_str!(concat!(env!("OUT_DIR"), "/static_cache_no_isolating.rs")),
+    ];
+    for generated in outputs {
+        for needle in [".unwrap()", ".expect(", "panic!", "unreachable!", "todo!"] {
+            assert!(
+                !generated.contains(needle),
+                "generated code contains `{needle}`"
+            );
+        }
+    }
+}
+
+#[test]
+fn bundles_initialise_and_format() {
+    for (lang, bundle) in LOCALES.entries() {
+        assert!(
+            bundle.has_message("plain"),
+            "{lang} bundle is missing `plain`"
+        );
+    }
+}
