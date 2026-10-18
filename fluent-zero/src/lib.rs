@@ -349,6 +349,7 @@ pub fn lookup_dynamic<'a, B: BundleCollection + ?Sized, C: CacheStore + ?Sized>(
 /// #             ("en-US", "app-title") => Some(CacheEntry::Static("My App")),
 /// #             ("fr-FR", "app-title") => Some(CacheEntry::Static("Mon appli")),
 /// #             ("en-US", "welcome-user") => Some(CacheEntry::Dynamic),
+/// #             ("en-US", "login.tooltip") => Some(CacheEntry::Static("Sign in to your account")),
 /// #             _ => None,
 /// #         }
 /// #     }
@@ -382,14 +383,13 @@ pub fn lookup_dynamic<'a, B: BundleCollection + ?Sized, C: CacheStore + ?Sized>(
 /// });
 /// assert_eq!(welcome, "Welcome, Alice! (5 unread)");
 ///
+/// // Attributes use the `message.attribute` key:
+/// let tooltip = t!("login.tooltip");
+/// assert_eq!(tooltip, "Sign in to your account");
+///
 /// // A missing key returns the key itself.
 /// assert_eq!(t!("no-such-message"), "no-such-message");
 /// # }
-/// ```
-///
-/// Attributes use the `message.attribute` key:
-/// ```rust,ignore
-/// let tooltip = t!("login.tooltip");
 /// ```
 #[allow(clippy::crate_in_macro_def)]
 #[macro_export]
