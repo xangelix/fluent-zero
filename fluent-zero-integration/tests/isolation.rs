@@ -37,7 +37,15 @@ fn disabled_isolation_applies_to_static_and_runtime_output() {
         let bundle = &***no_isolating::LOCALES.get(lang).unwrap();
         for (key, entry) in messages.entries() {
             if let CacheEntry::Static(value) = entry {
-                let pattern = bundle.get_message(key).and_then(|m| m.value()).unwrap();
+                // Keys are `message` or `message.attribute`.
+                let pattern = match key.split_once('.') {
+                    None => bundle.get_message(key).and_then(|m| m.value()),
+                    Some((id, attribute)) => bundle
+                        .get_message(id)
+                        .and_then(|m| m.get_attribute(attribute))
+                        .map(|a| a.value()),
+                }
+                .unwrap();
                 let mut errors = Vec::new();
                 assert_eq!(*value, bundle.format_pattern(pattern, None, &mut errors));
                 assert!(errors.is_empty(), "{lang}/{key}: {errors:?}");

@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     env,
     ffi::OsString,
     fs,
@@ -392,7 +392,12 @@ fn entry_definitions(source: &str) -> impl Iterator<Item = (&str, usize)> {
     })
 }
 
-/// Builds the `(message id, CacheEntry expression)` pairs for one locale.
+/// Builds the `(key, CacheEntry expression)` pairs for one locale.
+///
+/// Every message gets an entry under its id, and every attribute an entry
+/// under `"message.attribute"` (Fluent ids cannot contain `.`, so the keys
+/// never collide). Attributes are classified and formatted exactly like
+/// values, so a message with only attributes still gets static attributes.
 ///
 /// A message is static when its output cannot depend on runtime arguments:
 /// only text, string/number literals, and references to other static
@@ -421,24 +426,50 @@ fn static_cache_entries(
         let ast::Entry::Message(msg) = entry else {
             continue;
         };
+        let id = msg.id.name;
         let static_value = msg
             .value
             .as_ref()
-            .filter(|_| analysis.message(msg.id.name, None))
-            .and_then(|pattern| {
-                let mut errors = Vec::new();
-                let value = bundle.format_pattern(pattern, None, &mut errors);
-                errors.is_empty().then(|| value.into_owned())
-            });
-        let cache_entry = match static_value {
-            // `{:?}` on a `str` is a valid Rust string literal: quotes,
-            // backslashes and invisible characters are all escaped.
-            Some(value) => format!("::fluent_zero::CacheEntry::Static({value:?})"),
-            None => "::fluent_zero::CacheEntry::Dynamic".to_string(),
-        };
-        entries.push((msg.id.name.to_string(), cache_entry));
+            .filter(|_| analysis.message(id, None))
+            .and_then(|pattern| format_static(&bundle, pattern));
+        entries.push((id.to_string(), cache_entry(static_value)));
+
+        let mut seen = HashSet::new();
+        for attribute in &msg.attributes {
+            let name = attribute.id.name;
+            // The runtime resolves a repeated attribute name to its first
+            // definition; emit only that one (a duplicate PHF key would panic).
+            if !seen.insert(name) {
+                continue;
+            }
+            let static_value = analysis
+                .message(id, Some(name))
+                .then(|| format_static(&bundle, &attribute.value))
+                .flatten();
+            entries.push((format!("{id}.{name}"), cache_entry(static_value)));
+        }
     }
     entries
+}
+
+/// Formats a pattern the analysis proved static, or `None` if it does not
+/// format cleanly (it then stays dynamic).
+fn format_static<'r>(
+    bundle: &FluentBundle<&'r FluentResource>,
+    pattern: &'r ast::Pattern<&'r str>,
+) -> Option<String> {
+    let mut errors = Vec::new();
+    let value = bundle.format_pattern(pattern, None, &mut errors);
+    errors.is_empty().then(|| value.into_owned())
+}
+
+fn cache_entry(static_value: Option<String>) -> String {
+    match static_value {
+        // `{:?}` on a `str` is a valid Rust string literal: quotes,
+        // backslashes and invisible characters are all escaped.
+        Some(value) => format!("::fluent_zero::CacheEntry::Static({value:?})"),
+        None => "::fluent_zero::CacheEntry::Dynamic".to_string(),
+    }
 }
 
 /// Decides which messages and terms render the same text for any arguments.
@@ -934,6 +965,41 @@ via = Says { v }
         for id in ["missing", "x", "y", "attrs"] {
             assert_eq!(entries[id], DYNAMIC, "{id} should be dynamic");
         }
+    }
+
+    #[test]
+    fn attributes_get_dotted_keys_and_static_values() {
+        let source = "\
+-brand = Acme
+login = Log in
+    .tooltip = Sign in to { -brand }
+    .aria = { login }
+    .hint = Hi { $name }
+";
+        let entries = entries(source);
+        assert_eq!(entries["login"], static_literal("Log in"));
+        assert_eq!(entries["login.tooltip"], static_literal("Sign in to Acme"));
+        assert_eq!(entries["login.aria"], static_literal("Log in"));
+        assert_eq!(entries["login.hint"], DYNAMIC);
+    }
+
+    #[test]
+    fn attribute_only_messages_get_attribute_entries() {
+        let entries =
+            entries("field =\n    .placeholder = Name\n    .label = { field.placeholder }:\n");
+        // The bare id has no value; the runtime falls through it as before.
+        assert_eq!(entries["field"], DYNAMIC);
+        assert_eq!(entries["field.placeholder"], static_literal("Name"));
+        assert_eq!(entries["field.label"], static_literal("Name:"));
+    }
+
+    #[test]
+    fn repeated_attribute_names_keep_the_first() {
+        let source = "m = M\n    .a = First\n    .a = Second\n";
+        let generated = static_cache_entries(&"en-US".parse().unwrap(), source, true);
+        let keys: Vec<&str> = generated.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["m", "m.a"]);
+        assert_eq!(generated[1].1, static_literal("First"));
     }
 
     #[test]
