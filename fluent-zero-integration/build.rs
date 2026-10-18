@@ -1,3 +1,5 @@
 fn main() {
-    fluent_zero_build::generate_static_cache("locales");
+    fluent_zero_build::FluentZeroBuilder::new("locales")
+        .fallback_locale("en-US")
+        .generate();
 }

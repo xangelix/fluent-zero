@@ -68,7 +68,7 @@ fn main() {
 
 ### 4. Application Code
 
-In your `lib.rs` (or `main.rs`), you must include the generated file. This brings the `CACHE` and `LOCALES` statics into scope, which the `t!` macro relies on.
+In your `lib.rs` (or `main.rs`), you must include the generated file. This brings the `CATALOG` static (plus the plain `CACHE` and `LOCALES` maps and the `FALLBACK` locale) into scope, which the `t!` macro relies on.
 
 ```rust
 use fluent_zero::{t, set_lang};
@@ -99,11 +99,48 @@ fn main() {
 }
 ```
 
+### 5. Locale Negotiation & Fallback
+
+`set_lang` resolves a fallback chain once, so lookups never parse or negotiate. The chain drops variants, script and region in turn (`sr-Latn-RS` → `sr-Latn` → `sr-RS` → `sr`), and the build step maps each language (and script-implying tags such as `zh-TW`) to the best locale **your crate** actually ships, using [`fluent-langneg`](https://crates.io/crates/fluent-langneg) with CLDR likely subtags. So with these directories:
+
+| `set_lang(...)`  | `en-US/`, `fr-FR/`, `pt-PT/`, `zh-Hant/` |
+| ---------------- | ---------------------------------------- |
+| `fr`, `fr-CA`    | `fr-FR`                                  |
+| `pt-BR`          | `pt-PT`                                  |
+| `zh-TW`, `zh-HK` | `zh-Hant`                                |
+| `de`             | the fallback locale (`en-US`)            |
+
+A message missing from the chosen locale comes from the fallback locale, then the key itself. The fallback defaults to `en-US`; change it in `build.rs` (the build fails if no such locale directory exists, so a typo cannot silently disable it):
+
+```rust
+fn main() {
+    fluent_zero_build::FluentZeroBuilder::new("assets/locales")
+        .fallback_locale("en-GB")
+        .generate();
+}
+```
+
+The generated code exports it as `FALLBACK`.
+
+### 6. Per-Call Locale (servers, multi-user tools)
+
+`t!` reads the global language. To render for several users at once, build a `LocaleState` per user (or request) and use `t_in!`, which bypasses the global language entirely:
+
+```rust
+use fluent_zero::{LocaleState, t_in};
+
+let lang = LocaleState::new("pt-BR".parse()?); // resolves the chain once
+let title = t_in!(&lang, "app-title");          // still zero-allocation
+let welcome = t_in!(&lang, "welcome-user", { "name" => "Alice" });
+```
+
+`lookup_static_in` and `lookup_dynamic_in` are the function equivalents.
+
 ## 📦 Library Support & Nested Translations
 
 `fluent-zero` supports a modular architecture where libraries and dependencies manage their own translations independently, but share their end results with the caller.
 
-While the **translation data** is isolated per crate (compile-time), the **language selection** is global (runtime). When your application calls `fluent_zero::set_lang("fr-FR")`, all UI plugins, logging dependencies, and nested widgets will instantly switch contexts without manual propagation.
+While the **translation data** is isolated per crate (compile-time), the **language selection** is global (runtime). When your application calls `fluent_zero::set_lang("fr-FR")`, all UI plugins, logging dependencies, and nested widgets will instantly switch contexts without manual propagation. Each crate negotiates that language against its own locales and uses its own fallback locale, so a library shipping only `fr/` still answers `fr-FR`.
 
 ---
 

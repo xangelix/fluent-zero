@@ -3,7 +3,7 @@ use std::{borrow::Cow, collections::HashMap};
 // Imports
 use fluent_zero::{
     CacheEntry, CacheStore, ConcurrentFluentBundle, FluentArgs, FluentResource, LanguageIdentifier,
-    lookup_dynamic, lookup_static, set_lang,
+    LocaleState, lookup_dynamic, lookup_dynamic_in, lookup_static, lookup_static_in, set_lang,
 };
 
 // =========================================================================
@@ -200,6 +200,38 @@ fn t08_verify_zero_copy_pointer_address() {
     } else {
         panic!("Expected Borrowed result");
     }
+}
+
+#[test]
+fn t10_per_call_locale_ignores_the_global_language() {
+    let mocks = MockLocales::new();
+    let fr = LocaleState::new("fr-FR".parse().unwrap());
+
+    let result = lookup_static_in(&fr, &mocks.bundles, &mocks.cache, "hello");
+    assert_eq!(result, "Bonjour le monde");
+    assert!(matches!(result, Cow::Borrowed(_)));
+
+    // Missing in fr-FR: falls back to en-US.
+    let mut args = FluentArgs::new();
+    args.set("name", "Alice");
+    let result = lookup_dynamic_in(&fr, &mocks.bundles, &mocks.cache, "welcome", &args);
+    assert_eq!(result, "Welcome Alice");
+}
+
+#[test]
+fn t11_fallback_chain_drops_variants_and_subtags() {
+    let mocks = MockLocales::new();
+
+    // `fr-FR-1996` has no table of its own; its chain reaches `fr-FR`.
+    let variant = LocaleState::new("fr-FR-1996".parse().unwrap());
+    assert_eq!(
+        variant.chain().collect::<Vec<_>>(),
+        ["fr-FR-1996", "fr-FR", "fr"]
+    );
+    assert_eq!(
+        lookup_static_in(&variant, &mocks.bundles, &mocks.cache, "hello"),
+        "Bonjour le monde"
+    );
 }
 
 #[test]

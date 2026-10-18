@@ -6,13 +6,19 @@ use std::{
 };
 
 use fluent_bundle::{FluentBundle, FluentResource};
+use fluent_langneg::{NegotiationStrategy, negotiate_languages};
 use fluent_syntax::{ast, parser, unicode::unescape_unicode_to_string};
-use unic_langid::LanguageIdentifier;
+use unic_langid::{LanguageIdentifier, subtags};
+
+/// The fallback locale when none is configured, matching the runtime's
+/// `fluent_zero::DEFAULT_FALLBACK`.
+const DEFAULT_FALLBACK: &str = "en-US";
 
 /// A builder to configure and generate the static cache code for `fluent-zero`.
 pub struct FluentZeroBuilder {
     locales_dir: PathBuf,
     charset_dest: Option<PathBuf>,
+    fallback_locale: Option<String>,
 }
 
 impl Default for FluentZeroBuilder {
@@ -20,6 +26,7 @@ impl Default for FluentZeroBuilder {
         Self {
             locales_dir: PathBuf::from("assets/locales"),
             charset_dest: None,
+            fallback_locale: None,
         }
     }
 }
@@ -35,6 +42,7 @@ impl FluentZeroBuilder {
         Self {
             locales_dir: locales_dir_path.as_ref().to_path_buf(),
             charset_dest: None,
+            fallback_locale: None,
         }
     }
 
@@ -49,13 +57,28 @@ impl FluentZeroBuilder {
         self
     }
 
+    /// Sets the locale lookups fall back to when neither the active language
+    /// nor its fallback chain has a message. Defaults to `en-US`.
+    ///
+    /// The generated code exports it as `FALLBACK` and the `t!` macros use it.
+    /// When the locales directory holds any locale, [`generate`](Self::generate)
+    /// fails the build unless one of them is this locale, so a typo cannot
+    /// silently disable the fallback.
+    #[must_use]
+    pub fn fallback_locale(mut self, locale: &str) -> Self {
+        self.fallback_locale = Some(locale.to_string());
+        self
+    }
+
     /// Consumes the builder, parses the Fluent files, aggregates IPC variables,
     /// and generates the Rust static cache code.
     ///
     /// # Panics
     ///
-    /// Panics if the `OUT_DIR` environment variable is not set, or if critical
-    /// IO file system operations fail during compilation.
+    /// Panics if the `OUT_DIR` environment variable is not set, if critical
+    /// IO file system operations fail during compilation, or if the configured
+    /// fallback locale is not a valid language identifier or (when the locales
+    /// directory holds any locale) is not one of them.
     pub fn generate(self) {
         let out_dir = env::var("OUT_DIR").expect("OUT_DIR not set");
         let dest_path = Path::new(&out_dir).join("static_cache.rs");
@@ -77,8 +100,10 @@ impl FluentZeroBuilder {
             }
         }
 
+        let fallback = self.fallback_key();
         let mut bundle_entries: Vec<(String, String)> = Vec::new();
         let mut cache_root_entries: Vec<(String, String)> = Vec::new();
+        let mut available: Vec<LanguageIdentifier> = Vec::new();
 
         // 2. Process Local Translations (If present)
         if self.locales_dir.exists() {
@@ -102,7 +127,7 @@ impl FluentZeroBuilder {
                 };
 
                 let lang_key = lang_id.to_string();
-                let sanitized_lang = lang_key.replace('-', "_").to_uppercase();
+                let sanitized_lang = table_suffix(&lang_key);
 
                 let cache_name = format!("CACHE_{sanitized_lang}");
                 let bundle_name = format!("BUNDLE_{sanitized_lang}");
@@ -120,12 +145,23 @@ impl FluentZeroBuilder {
 
                 bundle_entries.push((lang_key.clone(), format!("&{bundle_name}")));
                 cache_root_entries.push((lang_key, cache_name));
+                available.push(lang_id);
             }
+        }
+
+        if self.fallback_locale.is_some()
+            && let Err(available) = check_fallback(&fallback, &available)
+        {
+            panic!(
+                "fluent-zero-build: fallback locale `{fallback}` has no directory in {} (available: {available})",
+                self.locales_dir.display(),
+            );
         }
 
         // 3. Complete Code Generation & Upstream Exporting
         // This unconditionally runs to guarantee valid empty PHF maps in aggregator crates.
         Self::write_root_maps(&mut file, &cache_root_entries, &bundle_entries);
+        Self::write_catalog(&mut file, &fallback, &available);
         self.export_charset_data(&mut file, &unique_chars, &out_dir);
     }
 
@@ -222,6 +258,58 @@ impl FluentZeroBuilder {
         ).unwrap();
     }
 
+    /// The canonical key of the configured fallback locale.
+    fn fallback_key(&self) -> String {
+        let Some(locale) = &self.fallback_locale else {
+            return DEFAULT_FALLBACK.to_string();
+        };
+        match locale.parse::<LanguageIdentifier>() {
+            Ok(id) => id.to_string(),
+            Err(err) => panic!(
+                "fluent-zero-build: fallback locale `{locale}` is not a valid language identifier: {err}"
+            ),
+        }
+    }
+
+    /// Writes `FALLBACK` and `CATALOG`, the tables the `t!` macros use: every
+    /// locale under its own key plus the negotiation aliases of
+    /// [`locale_aliases`], each pointing at the same cache and bundle statics.
+    fn write_catalog(file: &mut fs::File, fallback: &str, available: &[LanguageIdentifier]) {
+        writeln!(
+            file,
+            "\n/// The locale lookups fall back to when the active language has no message.\n\
+             pub const FALLBACK: &str = {fallback:?};"
+        )
+        .unwrap();
+
+        let tables = |key: &str| {
+            let suffix = table_suffix(key);
+            format!("(&CACHE_{suffix}, &BUNDLE_{suffix})")
+        };
+        let mut map = phf_codegen::Map::new();
+        map.phf_path("::fluent_zero::phf");
+        for id in available {
+            let key = id.to_string();
+            let value = tables(&key);
+            map.entry(key, value);
+        }
+        for (alias, target) in locale_aliases(available) {
+            map.entry(alias, tables(&target));
+        }
+        writeln!(
+            file,
+            "static CATALOG_LOCALES: ::fluent_zero::phf::Map<&'static str, ::fluent_zero::CatalogLocale> = {};",
+            map.build()
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "/// This crate's lookup tables, with locale negotiation aliases, as used by `t!` and `t_in!`.\n\
+             pub static CATALOG: ::fluent_zero::Catalog = ::fluent_zero::Catalog::new(FALLBACK, &CATALOG_LOCALES);"
+        )
+        .unwrap();
+    }
+
     fn export_charset_data(
         &self,
         file: &mut fs::File,
@@ -256,6 +344,123 @@ impl FluentZeroBuilder {
             println!("cargo:rerun-if-changed={}", charset_dest.display());
         }
     }
+}
+
+/// The suffix of a locale's generated `CACHE_*` / `BUNDLE_*` statics.
+fn table_suffix(lang_key: &str) -> String {
+    lang_key.replace('-', "_").to_uppercase()
+}
+
+/// Checks that `fallback` is one of the `available` locales, if there are any
+/// (crates that only aggregate dependencies have none). On failure, returns
+/// the sorted list of available locale keys for the error message.
+fn check_fallback(fallback: &str, available: &[LanguageIdentifier]) -> Result<(), String> {
+    let mut keys: Vec<String> = available.iter().map(ToString::to_string).collect();
+    if keys.is_empty() || keys.iter().any(|key| key == fallback) {
+        return Ok(());
+    }
+    keys.sort();
+    Err(keys.join(", "))
+}
+
+/// Maps the keys that end a runtime fallback chain to the best locale this
+/// crate has for them, as `(alias, target locale key)` pairs.
+///
+/// At runtime a language's chain drops variants, script and region in turn
+/// and always ends with the bare language (`pt-BR` tries `pt-BR`, then `pt`),
+/// so the chain alone already finds a more general locale. What it cannot find
+/// is a *more specific* one: `ru` when only `ru-RU/` exists, or `zh-TW` when
+/// only `zh-Hant/` exists. Those are resolved here, once per crate at build
+/// time against its own locales, so the runtime needs no likely-subtags data
+/// and each chain step stays a single map probe. Aliases are emitted for:
+///
+/// - every bare language, matched to its best locale by `fluent-langneg`
+///   (with CLDR likely subtags, so `pt` prefers `pt-BR` and `zh` prefers
+///   `zh-CN` when several regions exist), or else to the first locale of that
+///   language;
+/// - for locales written in a script that is not the language's default
+///   (`zh-Hant`, `zh-TW`, `sr-Latn`): the `language-script` key and every
+///   `language-region` key whose likely script is that script (`zh-TW`,
+///   `zh-HK`, `zh-MO`), but only when negotiation lands on the same script.
+///
+/// Keys that name an existing locale are never aliased.
+fn locale_aliases(available: &[LanguageIdentifier]) -> Vec<(String, String)> {
+    let mut available = available.to_vec();
+    // Negotiation breaks ties by order; directory order is not stable.
+    available.sort();
+    let existing: BTreeSet<String> = available.iter().map(ToString::to_string).collect();
+
+    let mut wanted: BTreeSet<LanguageIdentifier> = BTreeSet::new();
+    for id in &available {
+        let language = LanguageIdentifier::from_parts(id.language, None, None, &[]);
+        let script = likely_script(id);
+        if script.is_some() && script != likely_script(&language) {
+            wanted.insert(LanguageIdentifier::from_parts(
+                id.language,
+                script,
+                None,
+                &[],
+            ));
+            for region in two_letter_regions() {
+                let candidate =
+                    LanguageIdentifier::from_parts(id.language, None, Some(region), &[]);
+                if likely_script(&candidate) == script {
+                    wanted.insert(candidate);
+                }
+            }
+        }
+        wanted.insert(language);
+    }
+
+    wanted
+        .into_iter()
+        .filter(|requested| !existing.contains(&requested.to_string()))
+        .filter_map(|requested| {
+            let negotiated = negotiate_languages(
+                std::slice::from_ref(&requested),
+                &available,
+                None,
+                NegotiationStrategy::Lookup,
+            )
+            .first()
+            .copied();
+            let bare = requested.script.is_none() && requested.region.is_none();
+            let target = if bare {
+                // The bare language is the chain's last step before the
+                // fallback locale, and negotiation never crosses scripts
+                // (`zh` does not match `zh-Hant`): any locale of the language
+                // still beats the fallback.
+                negotiated.or_else(|| {
+                    available
+                        .iter()
+                        .find(|id| id.language == requested.language)
+                })?
+            } else {
+                // A script- or region-level alias that crosses scripts would
+                // beat the bare-language step of the chain for no gain.
+                negotiated.filter(|target| likely_script(target) == likely_script(&requested))?
+            };
+            Some((requested.to_string(), target.to_string()))
+        })
+        .collect()
+}
+
+/// The script `id` is written in, explicit or implied by CLDR likely subtags.
+fn likely_script(id: &LanguageIdentifier) -> Option<subtags::Script> {
+    let mut id = id.clone();
+    id.maximize();
+    id.script
+}
+
+/// Every syntactically valid two-letter region subtag (`AA` to `ZZ`).
+fn two_letter_regions() -> impl Iterator<Item = subtags::Region> {
+    (b'A'..=b'Z').flat_map(|first| {
+        (b'A'..=b'Z').filter_map(move |second| {
+            std::str::from_utf8(&[first, second])
+                .ok()
+                .and_then(|code| code.parse().ok())
+        })
+    })
 }
 
 /// Builds the `(message id, CacheEntry expression)` pairs for one locale.
@@ -649,6 +854,107 @@ via = Says { v }
         for id in ["missing", "x", "y", "attrs"] {
             assert_eq!(entries[id], DYNAMIC, "{id} should be dynamic");
         }
+    }
+
+    /// The negotiation aliases for `locales`, as a map.
+    fn aliases(locales: &[&str]) -> HashMap<String, String> {
+        let ids: Vec<LanguageIdentifier> = locales.iter().map(|l| l.parse().unwrap()).collect();
+        locale_aliases(&ids).into_iter().collect()
+    }
+
+    #[test]
+    fn bare_language_aliases_its_only_locale() {
+        let aliases = aliases(&["en-US", "ru-RU"]);
+        assert_eq!(aliases["ru"], "ru-RU");
+        assert_eq!(aliases["en"], "en-US");
+        assert_eq!(aliases.len(), 2, "{aliases:?}");
+    }
+
+    #[test]
+    fn bare_language_prefers_the_likely_region() {
+        let aliases = aliases(&["pt-PT", "pt-BR", "en-GB", "en-US", "zh-TW", "zh-CN"]);
+        assert_eq!(aliases["pt"], "pt-BR");
+        assert_eq!(aliases["en"], "en-US");
+        assert_eq!(aliases["zh"], "zh-CN");
+    }
+
+    #[test]
+    fn existing_locales_are_never_aliased() {
+        let aliases = aliases(&["pt", "pt-BR", "sr-Latn"]);
+        assert!(!aliases.contains_key("pt"), "{aliases:?}");
+        assert!(!aliases.contains_key("pt-BR"), "{aliases:?}");
+        assert!(!aliases.contains_key("sr-Latn"), "{aliases:?}");
+    }
+
+    #[test]
+    fn script_implying_regions_find_the_script_locale() {
+        let aliases = aliases(&["zh-Hans", "zh-Hant"]);
+        for region in ["zh-TW", "zh-HK", "zh-MO"] {
+            assert_eq!(aliases[region], "zh-Hant", "{region}");
+        }
+        assert_eq!(aliases["zh"], "zh-Hans");
+        // Regions written in the default script are left to the chain.
+        assert!(!aliases.contains_key("zh-CN"), "{aliases:?}");
+    }
+
+    #[test]
+    fn script_aliases_point_at_regional_locales() {
+        let aliases = aliases(&["zh-TW", "zh-CN"]);
+        assert_eq!(aliases["zh-Hant"], "zh-TW");
+        assert_eq!(aliases["zh-HK"], "zh-TW");
+        assert_eq!(aliases["zh"], "zh-CN");
+    }
+
+    #[test]
+    fn script_aliases_never_cross_scripts() {
+        // Only a Traditional locale: Simplified-script keys must not alias to
+        // it, the bare language is enough.
+        let aliases = aliases(&["zh-TW"]);
+        assert_eq!(aliases["zh"], "zh-TW");
+        assert!(!aliases.contains_key("zh-Hans"), "{aliases:?}");
+        assert!(!aliases.contains_key("zh-SG"), "{aliases:?}");
+    }
+
+    #[test]
+    fn bare_language_falls_back_across_scripts() {
+        let aliases = aliases(&["zh-Hant", "en-US"]);
+        assert_eq!(aliases["zh"], "zh-Hant");
+        assert_eq!(aliases["zh-TW"], "zh-Hant");
+    }
+
+    #[test]
+    fn no_locales_no_aliases() {
+        assert!(aliases(&[]).is_empty());
+    }
+
+    #[test]
+    fn fallback_key_is_canonicalised() {
+        let builder = FluentZeroBuilder::new("locales").fallback_locale("en-gb");
+        assert_eq!(builder.fallback_key(), "en-GB");
+        assert_eq!(FluentZeroBuilder::new("locales").fallback_key(), "en-US");
+    }
+
+    #[test]
+    fn fallback_must_be_an_available_locale() {
+        let available: Vec<LanguageIdentifier> = ["fr-FR", "en-US"]
+            .iter()
+            .map(|l| l.parse().unwrap())
+            .collect();
+        assert_eq!(check_fallback("en-US", &available), Ok(()));
+        assert_eq!(
+            check_fallback("en-GB", &available),
+            Err("en-US, fr-FR".to_string())
+        );
+        // A crate without locales of its own accepts any fallback.
+        assert_eq!(check_fallback("en-GB", &[]), Ok(()));
+    }
+
+    #[test]
+    #[should_panic(expected = "not a valid language identifier")]
+    fn invalid_fallback_is_rejected() {
+        let _ = FluentZeroBuilder::new("locales")
+            .fallback_locale("not a locale")
+            .fallback_key();
     }
 
     #[test]
