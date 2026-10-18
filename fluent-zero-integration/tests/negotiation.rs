@@ -53,6 +53,23 @@ fn missing_messages_use_the_configured_fallback() {
 }
 
 #[test]
+fn attributes_resolve_through_negotiation_and_fallback() {
+    // `fr-CA` negotiates to `fr-FR`, which has a static `login.tooltip`.
+    let tooltip = t_in!(&lang("fr-CA"), "login.tooltip");
+    assert_eq!(tooltip, "Se connecter");
+    assert!(matches!(tooltip, Cow::Borrowed(_)));
+    // Missing from `fr-FR`: the configured fallback, like message values.
+    assert_eq!(t_in!(&lang("fr"), "login.en-only"), "Only in English");
+    assert_eq!(t_in!(&lang("pt-BR"), "search.placeholder"), "Search Acme");
+    assert_eq!(
+        t_in!(&lang("zh-TW"), "login.greeting", { "name" => "Ana" }),
+        "Welcome back, \u{2068}Ana\u{2069}"
+    );
+    // Missing everywhere: the key itself.
+    assert_eq!(t_in!(&lang("fr-CA"), "login.nope"), "login.nope");
+}
+
+#[test]
 fn aliases_stay_out_of_the_plain_maps() {
     let mut cache: Vec<&str> = CACHE.keys().copied().collect();
     let mut bundles: Vec<&str> = LOCALES.keys().copied().collect();
@@ -70,6 +87,9 @@ fn global_language_is_negotiated_and_per_call_locales_bypass_it() {
     assert_eq!(t!("about"), "About Acme");
     assert_eq!(t_in!(&lang("pt-BR"), "plain"), "Olá");
     assert_eq!(t!("plain"), "Bonjour");
+
+    assert_eq!(t!("login.tooltip"), "Se connecter");
+    assert_eq!(t!("login.en-only"), "Only in English");
 
     set_lang("pt-BR".parse().expect("valid language id"));
     assert_eq!(

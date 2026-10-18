@@ -290,8 +290,13 @@ fn resolve_entry<'a, B: BundleCollection + ?Sized, C: CacheStore + ?Sized>(
         CacheEntry::Static(s) => Some(Cow::Borrowed(s)),
         CacheEntry::Dynamic => {
             let bundle = bundles.get_bundle(lang)?;
-            let msg = bundle.get_message(key)?;
-            let pattern = msg.value()?;
+            // Fluent message IDs cannot contain `.`, so a dotted key always
+            // names an attribute (`message.attribute`). Only this cold path
+            // splits the key; static entries never get here.
+            let pattern = match key.split_once('.') {
+                None => bundle.get_message(key)?.value()?,
+                Some((id, attribute)) => bundle.get_message(id)?.get_attribute(attribute)?.value(),
+            };
             let mut errors = vec![];
             Some(bundle.format_pattern(pattern, args, &mut errors))
         }
@@ -343,7 +348,7 @@ fn lookup_core<'a, B: BundleCollection + ?Sized, C: CacheStore + ?Sized>(
 ///
 /// * `bundles` - The collection of Fluent bundles (usually `crate::LOCALES`).
 /// * `cache` - The static cache map (usually `crate::CACHE`).
-/// * `key` - The message ID to look up.
+/// * `key` - The message ID to look up, or `message.attribute` for an attribute.
 pub fn lookup_static<'a, B: BundleCollection + ?Sized, C: CacheStore + ?Sized>(
     bundles: &'a B,
     cache: &C,
@@ -362,7 +367,7 @@ pub fn lookup_static<'a, B: BundleCollection + ?Sized, C: CacheStore + ?Sized>(
 ///
 /// * `bundles` - The collection of Fluent bundles.
 /// * `cache` - The static cache map.
-/// * `key` - The message ID to look up.
+/// * `key` - The message ID to look up, or `message.attribute` for an attribute.
 /// * `args` - The arguments to interpolate into the message.
 pub fn lookup_dynamic<'a, B: BundleCollection + ?Sized, C: CacheStore + ?Sized>(
     bundles: &'a B,
@@ -416,6 +421,11 @@ pub fn lookup_dynamic_in<'a, B: BundleCollection + ?Sized, C: CacheStore + ?Size
 ///     "name" => "Alice",
 ///     "unread_count" => 5
 /// });
+/// ```
+///
+/// Attributes use the `message.attribute` key:
+/// ```rust,ignore
+/// let tooltip = t!("login.tooltip");
 /// ```
 #[allow(clippy::crate_in_macro_def)]
 #[macro_export]
