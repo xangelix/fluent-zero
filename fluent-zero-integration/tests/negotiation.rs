@@ -5,8 +5,9 @@
 use std::borrow::Cow;
 
 use fluent_zero::{LocaleState, set_lang, t, t_in};
-// `t!` and `t_in!` resolve `crate::CATALOG`.
-use fluent_zero_integration::{CACHE, CATALOG, FALLBACK, LOCALES};
+// `t!` and `t_in!` resolve `crate::CATALOG` (and check literal keys against
+// `crate::__FLUENT_ZERO_KEYS`).
+use fluent_zero_integration::{__FLUENT_ZERO_KEYS, CACHE, CATALOG, FALLBACK, LOCALES};
 
 fn lang(tag: &str) -> LocaleState {
     LocaleState::new(tag.parse().expect("valid language id"))
@@ -49,7 +50,9 @@ fn missing_messages_use_the_configured_fallback() {
     assert_eq!(CATALOG.fallback(), FALLBACK);
     assert_eq!(t_in!(&lang("pt-BR"), "about"), "About Acme");
     assert_eq!(t_in!(&lang("de"), "plain"), "Hello");
-    assert_eq!(t_in!(&lang("de"), "no-such-message"), "no-such-message");
+    // Bound to a variable: a literal missing key would fail to compile.
+    let missing = "no-such-message";
+    assert_eq!(t_in!(&lang("de"), missing), "no-such-message");
 }
 
 #[test]
@@ -66,7 +69,8 @@ fn attributes_resolve_through_negotiation_and_fallback() {
         "Welcome back, \u{2068}Ana\u{2069}"
     );
     // Missing everywhere: the key itself.
-    assert_eq!(t_in!(&lang("fr-CA"), "login.nope"), "login.nope");
+    let missing = "login.nope";
+    assert_eq!(t_in!(&lang("fr-CA"), missing), "login.nope");
 }
 
 #[test]
