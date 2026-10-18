@@ -94,7 +94,6 @@ impl LocaleState {
 
     /// The locale keys a lookup tries, most specific first, before the
     /// store's fallback locale.
-    #[must_use]
     pub fn chain(&self) -> impl ExactSizeIterator<Item = &str> {
         self.chain.iter().map(|key| &**key)
     }
