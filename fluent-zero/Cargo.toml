@@ -2,19 +2,14 @@
 name = "fluent-zero"
 description = "A zero-allocation, high-performance Fluent localization loader optimized for GUIs and games via compile-time caching to return &'static str for static messages."
 version = "0.1.5"
-edition = "2024"
-license = "MIT"
-readme = "../README.md"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme.workspace = true
 documentation = "https://docs.rs/fluent-zero"
-repository = "https://github.com/xangelix/fluent-zero"
-categories = [
-    "localization",
-    "internationalization",
-    "gui",
-    "caching",
-    "game-development",
-]
-keywords = ["fluent", "i18n", "zero-allocation", "static", "l10n"]
+repository.workspace = true
+categories.workspace = true
+keywords.workspace = true
 
 [dependencies]
 arc-swap = "1"

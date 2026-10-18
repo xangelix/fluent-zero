@@ -285,9 +285,13 @@ While `fluent-zero` is faster at runtime, it comes with trade-offs compared to `
 2. **Binary Size**: Static strings are embedded into the binary executable code.
 3. **Flexibility**: You cannot easily load new FTL files from the filesystem at runtime without restarting the application (the cache is baked in).
 
+## Minimum Supported Rust Version
+
+The MSRV is **Rust 1.88**, declared as `rust-version` and tested in CI.
+
 ## License
 
-This project is licensed under the [MIT license](https://spdx.org/licenses/MIT).
+This project is licensed under the [MIT license](LICENSE).
 
 ## Notice
 
