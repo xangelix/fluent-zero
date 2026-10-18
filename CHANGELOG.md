@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.2.0 (unreleased)
+## v0.2.0
 
 **⚠️ Breaking:** keep `fluent-zero` and `fluent-zero-build` on the same version; generated code now checks this at compile time.
 
@@ -12,6 +12,7 @@
 - **Diagnostics:** `set_error_handler` / `LookupError` (or the `tracing` feature) for missing keys and arguments; translation coverage warnings via `missing_translations`.
 - **Options:** `use_isolating(false)` to drop U+2068/U+2069 bidi marks.
 - **Packaging:** MIT `LICENSE` shipped in both crates, MSRV 1.88, hardened CI, benchmarks and a zero-allocation test.
+- **Dependency upgrades:** `arc-swap` 1.9. `fluent-langneg` stays on 0.13 to match `fluent-bundle` 0.16 (0.14 moved to ICU4X identifiers).
 
 ## v0.1.5
 
