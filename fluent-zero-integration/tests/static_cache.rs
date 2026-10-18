@@ -132,12 +132,17 @@ fn attribute_lookups_through_t_macro() {
 
 #[test]
 fn generated_code_has_no_panic_paths() {
-    let generated = include_str!(concat!(env!("OUT_DIR"), "/static_cache.rs"));
-    for needle in [".unwrap()", ".expect(", "panic!", "unreachable!", "todo!"] {
-        assert!(
-            !generated.contains(needle),
-            "generated code contains `{needle}`"
-        );
+    let outputs = [
+        include_str!(concat!(env!("OUT_DIR"), "/static_cache.rs")),
+        include_str!(concat!(env!("OUT_DIR"), "/static_cache_no_isolating.rs")),
+    ];
+    for generated in outputs {
+        for needle in [".unwrap()", ".expect(", "panic!", "unreachable!", "todo!"] {
+            assert!(
+                !generated.contains(needle),
+                "generated code contains `{needle}`"
+            );
+        }
     }
 }
 
