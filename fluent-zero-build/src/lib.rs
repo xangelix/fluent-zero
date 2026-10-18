@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     env,
+    ffi::OsString,
     fmt::Write as _,
     fs,
     io::Write as _,
@@ -8,7 +9,7 @@ use std::{
 };
 
 use fluent_bundle::{FluentBundle, FluentResource};
-use fluent_syntax::{ast, parser, unicode::unescape_unicode_to_string};
+use fluent_syntax::{ast, parser, serializer, unicode::unescape_unicode_to_string};
 use unic_langid::LanguageIdentifier;
 
 /// The locale every other locale is checked against for missing translations.
@@ -36,6 +37,7 @@ pub struct FluentZeroBuilder {
     locales_dir: PathBuf,
     charset_dest: Option<PathBuf>,
     missing_translations: MissingTranslations,
+    use_isolating: bool,
 }
 
 impl Default for FluentZeroBuilder {
@@ -56,6 +58,7 @@ impl FluentZeroBuilder {
             locales_dir: locales_dir_path.as_ref().to_path_buf(),
             charset_dest: None,
             missing_translations: MissingTranslations::default(),
+            use_isolating: true,
         }
     }
 
@@ -73,9 +76,29 @@ impl FluentZeroBuilder {
     ///
     /// **Dependency Aggregation:** This natively aggregates characters from dependencies
     /// using Cargo's standard IPC. No metadata scraping or tree walking is required.
+    ///
+    /// `dest` should live inside `OUT_DIR` (e.g. `Path::new(&out_dir).join("chars.txt")`)
+    /// so the build stays hermetic. A relative path is resolved against the
+    /// build script's working directory (the package root); one that lands
+    /// outside `OUT_DIR` still works, but emits a `cargo:warning`.
     #[must_use]
     pub fn export_charset<P: AsRef<Path>>(mut self, dest: P) -> Self {
         self.charset_dest = Some(dest.as_ref().to_path_buf());
+        self
+    }
+
+    /// Whether placeables are wrapped in the Unicode bidi isolation marks
+    /// U+2068 / U+2069 (default `true`, matching `fluent-bundle`).
+    ///
+    /// The marks keep right-to-left arguments from scrambling surrounding
+    /// left-to-right text (and vice versa), but many GUI font stacks render
+    /// them as boxes or odd gaps. The setting applies to the generated runtime
+    /// bundles and to static messages formatted at build time alike, so both
+    /// stay byte-identical. While enabled, the marks are added to `CHARSET`
+    /// whenever some message can emit them.
+    #[must_use]
+    pub fn use_isolating(mut self, use_isolating: bool) -> Self {
+        self.use_isolating = use_isolating;
         self
     }
 
@@ -100,11 +123,13 @@ impl FluentZeroBuilder {
         // 1. Dependency Aggregation via Cargo IPC.
         // Cargo automatically propagates `cargo:KEY=VALUE` emitted by dependency build
         // scripts up to dependents as `DEP_<LINKS>_<KEY>` if the dependency specifies a `links` key.
-        for (env_key, env_val) in env::vars() {
-            if env_key.starts_with("DEP_")
-                && env_key.ends_with("_FLUENT_CHARSET_PATH")
-                && let Ok(content) = fs::read_to_string(&env_val)
-            {
+        for charset_path in dependency_charset_paths(env::vars_os()) {
+            if let Ok(content) = fs::read_to_string(&charset_path) {
+                // Cargo already reruns this script when the dependency's build
+                // script reruns; registering the file as well is cheap and keeps
+                // the dependency link explicit. Only existing files are
+                // registered: Cargo treats a missing path as always stale.
+                println!("cargo:rerun-if-changed={charset_path}");
                 extend_visible(&mut unique_chars, &content);
             }
         }
@@ -112,17 +137,15 @@ impl FluentZeroBuilder {
         let mut bundle_entries: Vec<(String, String)> = Vec::new();
         let mut cache_root_entries: Vec<(String, String)> = Vec::new();
         let mut message_ids: Vec<(String, BTreeSet<String>)> = Vec::new();
+        let mut all_keys: BTreeSet<String> = BTreeSet::new();
+        let mut fallback_sources: HashMap<String, String> = HashMap::new();
 
         // 2. Process Local Translations (If present)
         if self.locales_dir.exists() {
             println!("cargo:rerun-if-changed={}", self.locales_dir.display());
-            let dir_entries =
-                fs::read_dir(&self.locales_dir).expect("Failed to read locales directory");
 
-            for entry in dir_entries {
-                let entry = entry.expect("Failed to read directory entry");
-                let path = entry.path();
-
+            // Sorted so the generated file is identical on every filesystem.
+            for path in sorted_dir_entries(&self.locales_dir) {
                 if !path.is_dir() {
                     continue;
                 }
@@ -140,15 +163,25 @@ impl FluentZeroBuilder {
                 let cache_name = format!("CACHE_{sanitized_lang}");
                 let bundle_name = format!("BUNDLE_{sanitized_lang}");
 
-                let combined_ftl_source =
-                    Self::process_locale_dir(&path, &lang_key, &mut unique_chars);
-                let cache_entries = static_cache_entries(&lang_id, &combined_ftl_source);
+                let combined_ftl_source = Self::process_locale_dir(
+                    &path,
+                    &lang_key,
+                    &mut unique_chars,
+                    self.use_isolating,
+                );
+                let cache_entries =
+                    static_cache_entries(&lang_id, &combined_ftl_source, self.use_isolating);
+                all_keys.extend(cache_entries.iter().map(|(key, _)| key.clone()));
+                if lang_key == FALLBACK_LOCALE {
+                    fallback_sources = message_sources(&combined_ftl_source);
+                }
 
                 Self::write_bundle_initializer(
                     &mut file,
                     &bundle_name,
                     &lang_key,
                     &combined_ftl_source,
+                    self.use_isolating,
                 );
                 Self::write_cache_map(&mut file, &cache_name, &cache_entries);
 
@@ -166,6 +199,12 @@ impl FluentZeroBuilder {
                 bundle_entries.push((lang_key.clone(), format!("&{bundle_name}")));
                 cache_root_entries.push((lang_key, cache_name));
             }
+        } else if let Some(watch) = missing_dir_watch_path(&self.locales_dir, Path::new(&out_dir)) {
+            // Cargo treats a missing `rerun-if-changed` path as always stale,
+            // which would rerun this script and rebuild the crate on every
+            // build. Watching the closest existing ancestor instead still
+            // notices the locales directory being created later.
+            println!("cargo:rerun-if-changed={}", watch.display());
         }
 
         self.check_coverage(&message_ids);
@@ -173,6 +212,7 @@ impl FluentZeroBuilder {
         // 3. Complete Code Generation & Upstream Exporting
         // This unconditionally runs to guarantee valid empty PHF maps in aggregator crates.
         Self::write_root_maps(&mut file, &cache_root_entries, &bundle_entries);
+        Self::write_keys(&mut file, &all_keys, &fallback_sources);
         self.export_charset_data(&mut file, &unique_chars, &out_dir);
     }
 
@@ -180,16 +220,13 @@ impl FluentZeroBuilder {
         path: &Path,
         lang_key: &str,
         unique_chars: &mut BTreeSet<char>,
+        use_isolating: bool,
     ) -> String {
         let mut combined_ftl_source = String::new();
         let mut definitions = Definitions::default();
+        let mut emits_isolation_marks = false;
 
-        let entries = fs::read_dir(path).expect("Failed to read locale subdirectory");
-
-        for file_entry in entries {
-            let file_entry = file_entry.expect("Failed to read file entry");
-            let file_path = file_entry.path();
-
+        for file_path in sorted_dir_entries(path) {
             if file_path.extension().is_some_and(|ext| ext == "ftl") {
                 println!("cargo:rerun-if-changed={}", file_path.display());
                 let source = fs::read_to_string(&file_path).expect("Failed to read FTL file");
@@ -204,12 +241,28 @@ impl FluentZeroBuilder {
                 };
                 for entry in ast.body {
                     match entry {
-                        ast::Entry::Message(msg) => harvest_message_chars(&msg, unique_chars),
-                        ast::Entry::Term(term) => harvest_term_chars(&term, unique_chars),
+                        ast::Entry::Message(msg) => {
+                            harvest_message_chars(&msg, unique_chars);
+                            emits_isolation_marks |= msg
+                                .value
+                                .iter()
+                                .chain(msg.attributes.iter().map(|a| &a.value))
+                                .any(pattern_isolates);
+                        }
+                        ast::Entry::Term(term) => {
+                            harvest_term_chars(&term, unique_chars);
+                            emits_isolation_marks |= std::iter::once(&term.value)
+                                .chain(term.attributes.iter().map(|a| &a.value))
+                                .any(pattern_isolates);
+                        }
                         _ => {}
                     }
                 }
             }
+        }
+
+        if use_isolating && emits_isolation_marks {
+            unique_chars.extend(['\u{2068}', '\u{2069}']);
         }
 
         combined_ftl_source
@@ -240,8 +293,14 @@ impl FluentZeroBuilder {
         bundle_name: &str,
         lang_key: &str,
         combined_ftl_source: &str,
+        use_isolating: bool,
     ) {
         let escaped_ftl = format!("{combined_ftl_source:?}");
+        let isolating_code = if use_isolating {
+            ""
+        } else {
+            "\x20   bundle.set_use_isolating(false);\n"
+        };
         // This runs once per locale, on its first dynamic lookup, so it must
         // never panic. Each fallible step below was already proven to succeed
         // at build time, so the fallbacks are unreachable and exist only to
@@ -255,6 +314,7 @@ impl FluentZeroBuilder {
             "std::sync::LazyLock::new(|| {{\n\
             \x20   let lang: ::fluent_zero::LanguageIdentifier = \"{lang_key}\".parse().unwrap_or_default();\n\
             \x20   let mut bundle = ::fluent_zero::ConcurrentFluentBundle::new_concurrent(vec![lang]);\n\
+            {isolating_code}\
             \x20   let res = ::fluent_zero::FluentResource::try_new({escaped_ftl}.to_string()).unwrap_or_else(|(res, _)| res);\n\
             \x20   bundle.add_resource_overriding(res);\n\
             \x20   bundle\n\
@@ -307,6 +367,62 @@ impl FluentZeroBuilder {
         ).unwrap();
     }
 
+    /// Writes `pub mod keys` (one constant per message ID) and the sorted
+    /// key list `t!` checks string literal keys against at compile time.
+    fn write_keys(
+        file: &mut fs::File,
+        all_keys: &BTreeSet<String>,
+        fallback_sources: &HashMap<String, String>,
+    ) {
+        writeln!(
+            file,
+            "\n/// Every message ID and `message.attribute` key found in any locale, as a\n\
+             /// constant. Using these instead of string literals turns a mistyped key\n\
+             /// into a compile error.\n\
+             pub mod keys {{"
+        )
+        .unwrap();
+        for (name, key) in key_const_names(all_keys) {
+            if name != key_const_base(key) {
+                println!(
+                    "cargo:warning=fluent-zero: message ID `{key}` clashes with another ID's constant name; it is available as `keys::{name}`"
+                );
+            }
+            // Fluent IDs cannot contain `.`, so a dotted key is an attribute.
+            let kind = if key.contains('.') {
+                "Attribute"
+            } else {
+                "Message"
+            };
+            let doc = match fallback_sources.get(key) {
+                Some(source) => format!(
+                    "{kind} `{key}`. Fallback locale (`{FALLBACK_LOCALE}`) text:\n\n{}",
+                    fenced_text(source)
+                ),
+                None => format!(
+                    "{kind} `{key}`. Not defined in the fallback locale (`{FALLBACK_LOCALE}`)."
+                ),
+            };
+            writeln!(
+                file,
+                "    #[doc = {doc:?}]\n    pub const {name}: &str = {key:?};"
+            )
+            .unwrap();
+        }
+        writeln!(file, "}}").unwrap();
+
+        // `t!` binary-searches this list in a `const` item, so it must stay
+        // sorted by byte order: `BTreeSet<String>` iterates in exactly `str`'s `Ord`.
+        let sorted: Vec<&String> = all_keys.iter().collect();
+        writeln!(
+            file,
+            "\n/// Sorted message IDs; `t!` validates string literal keys against it.\n\
+             #[doc(hidden)]\n\
+             pub const __FLUENT_ZERO_KEYS: &[&str] = &{sorted:?};"
+        )
+        .unwrap();
+    }
+
     fn export_charset_data(
         &self,
         file: &mut fs::File,
@@ -333,6 +449,16 @@ impl FluentZeroBuilder {
         }
 
         if let Some(charset_dest) = &self.charset_dest {
+            if charset_dest.is_relative()
+                && let Ok(cwd) = env::current_dir()
+                && !lexically_inside(&cwd.join(charset_dest), Path::new(out_dir))
+            {
+                println!(
+                    "cargo:warning=fluent-zero-build: export_charset path `{}` is outside OUT_DIR; \
+                     write it under OUT_DIR to keep the build hermetic",
+                    charset_dest.display()
+                );
+            }
             if let Some(parent) = charset_dest.parent() {
                 let _ = fs::create_dir_all(parent);
             }
@@ -472,13 +598,19 @@ fn entry_definitions(source: &str) -> impl Iterator<Item = (&str, usize)> {
 /// messages are formatted here, at build time, by the same `fluent-bundle`
 /// the runtime uses with the same settings, so the embedded `&'static str` is
 /// byte-identical to what the runtime bundle would produce (bidi isolation
-/// marks included). Anything that fails to format cleanly stays dynamic so the
-/// runtime keeps its existing behaviour for it.
-fn static_cache_entries(lang_id: &LanguageIdentifier, source: &str) -> Vec<(String, String)> {
+/// marks included, or omitted alike when `use_isolating` is off). Anything
+/// that fails to format cleanly stays dynamic so the runtime keeps its
+/// existing behaviour for it.
+fn static_cache_entries(
+    lang_id: &LanguageIdentifier,
+    source: &str,
+    use_isolating: bool,
+) -> Vec<(String, String)> {
     // Syntax errors were already rejected per file, so a parse error here is
     // impossible; fall back to the partial resource rather than panicking.
     let resource = FluentResource::try_new(source.to_owned()).unwrap_or_else(|(res, _)| res);
     let mut bundle = FluentBundle::new(vec![lang_id.clone()]);
+    bundle.set_use_isolating(use_isolating);
     bundle.add_resource_overriding(&resource);
 
     let mut analysis = StaticAnalysis::new(&resource);
@@ -641,6 +773,114 @@ impl<'r> StaticAnalysis<'r> {
     }
 }
 
+/// The FTL source of every message in `source` (value and attributes, without
+/// comments), normalised by the `fluent-syntax` serializer, keyed by message
+/// ID; plus, under each `"message.attribute"` key, the message reduced to just
+/// that attribute. The first definition of an ID or attribute wins, as it does
+/// in the runtime bundle.
+fn message_sources(source: &str) -> HashMap<String, String> {
+    fn serialize(msg: ast::Message<&str>) -> String {
+        let resource = ast::Resource {
+            body: vec![ast::Entry::Message(msg)],
+        };
+        serializer::serialize(&resource).trim_end().to_string()
+    }
+
+    let resource = FluentResource::try_new(source.to_owned()).unwrap_or_else(|(res, _)| res);
+    let mut sources = HashMap::new();
+    for entry in resource.entries() {
+        if let ast::Entry::Message(msg) = entry {
+            let id = msg.id.name;
+            if sources.contains_key(id) {
+                continue;
+            }
+            for attribute in &msg.attributes {
+                sources
+                    .entry(format!("{id}.{}", attribute.id.name))
+                    .or_insert_with(|| {
+                        serialize(ast::Message {
+                            id: msg.id.clone(),
+                            value: None,
+                            attributes: vec![attribute.clone()],
+                            comment: None,
+                        })
+                    });
+            }
+            let mut msg = msg.clone();
+            msg.comment = None;
+            sources.insert(id.to_string(), serialize(msg));
+        }
+    }
+    sources
+}
+
+/// Wraps `text` in a fenced `text` code block, so rustdoc neither renders it
+/// as Markdown nor runs it as a doctest. The fence is longer than any run of
+/// backticks inside `text`.
+fn fenced_text(text: &str) -> String {
+    let mut longest = 0;
+    let mut run = 0;
+    for c in text.chars() {
+        run = if c == '`' { run + 1 } else { 0 };
+        longest = longest.max(run);
+    }
+    let fence = "`".repeat(longest.max(2) + 1);
+    format!("{fence}text\n{text}\n{fence}")
+}
+
+/// The constant name a key gets when nothing clashes with it: ASCII letters
+/// are uppercased, ASCII digits kept, and every other character (`-`, `.`,
+/// `_`, anything non-ASCII) becomes `_`. A name that would not start with an
+/// ASCII letter is prefixed with `KEY_`. The result is always a valid Rust
+/// identifier, and never a keyword (keywords are not all uppercase).
+fn key_const_base(key: &str) -> String {
+    let name: String = key
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if name.starts_with(|c: char| c.is_ascii_alphabetic()) {
+        name
+    } else {
+        format!("KEY_{name}")
+    }
+}
+
+/// Assigns every key a unique constant name, deterministically.
+///
+/// Keys are visited in byte order. The first key to want a base name (see
+/// [`key_const_base`]) gets it; each later key wanting the same name (e.g.
+/// `foo_bar` after `foo-bar`) gets `{BASE}_{n}` with the smallest `n >= 2`
+/// that is neither another key's base name nor already assigned, so a
+/// suffixed name never takes the plain name of a different key.
+fn key_const_names(keys: &BTreeSet<String>) -> Vec<(String, &str)> {
+    let bases: BTreeSet<String> = keys.iter().map(|key| key_const_base(key)).collect();
+    let mut assigned: BTreeSet<String> = BTreeSet::new();
+    let mut names = Vec::with_capacity(keys.len());
+    for key in keys {
+        let base = key_const_base(key);
+        let mut name = base.clone();
+        if assigned.contains(&name) {
+            let mut n = 2;
+            loop {
+                name = format!("{base}_{n}");
+                if !bases.contains(&name) && !assigned.contains(&name) {
+                    break;
+                }
+                n += 1;
+            }
+        }
+        assigned.insert(name.clone());
+        names.push((name, key.as_str()));
+    }
+    names
+}
+
 fn attribute_value<'r>(
     attributes: &'r [ast::Attribute<&'r str>],
     name: &str,
@@ -723,8 +963,112 @@ fn harvest_inline_chars(inline: &ast::InlineExpression<String>, unique_chars: &m
     }
 }
 
+/// Whether formatting `pattern` (or a select variant inside it) can wrap a
+/// placeable in U+2068 / U+2069. Mirrors `fluent-bundle`: only placeables in
+/// patterns of more than one element are isolated, and message references,
+/// term references and string literals never are. Referenced messages and
+/// terms are checked on their own.
+fn pattern_isolates(pattern: &ast::Pattern<String>) -> bool {
+    let multi_element = pattern.elements.len() > 1;
+    pattern.elements.iter().any(|element| match element {
+        ast::PatternElement::TextElement { .. } => false,
+        ast::PatternElement::Placeable { expression } => {
+            let isolated = multi_element
+                && !matches!(
+                    expression,
+                    ast::Expression::Inline(
+                        ast::InlineExpression::MessageReference { .. }
+                            | ast::InlineExpression::TermReference { .. }
+                            | ast::InlineExpression::StringLiteral { .. }
+                    )
+                );
+            isolated || expression_isolates(expression)
+        }
+    })
+}
+
+fn expression_isolates(expression: &ast::Expression<String>) -> bool {
+    match expression {
+        ast::Expression::Select { variants, .. } => variants
+            .iter()
+            .any(|variant| pattern_isolates(&variant.value)),
+        ast::Expression::Inline(ast::InlineExpression::Placeable { expression }) => {
+            expression_isolates(expression)
+        }
+        ast::Expression::Inline(_) => false,
+    }
+}
+
 fn extend_visible(unique_chars: &mut BTreeSet<char>, text: &str) {
     unique_chars.extend(text.chars().filter(|c| !c.is_control()));
+}
+
+/// Lists the entries of `dir` sorted by path, so processing order (and with
+/// it the generated code) does not depend on the filesystem's `read_dir` order.
+fn sorted_dir_entries(dir: &Path) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = fs::read_dir(dir)
+        .expect("Failed to read directory")
+        .map(|entry| entry.expect("Failed to read directory entry").path())
+        .collect();
+    paths.sort();
+    paths
+}
+
+/// Picks the charset files dependencies exported through Cargo's `links`
+/// IPC (`DEP_<LINKS>_FLUENT_CHARSET_PATH`), sorted for stable output.
+///
+/// Takes `vars_os` rather than `vars`, which panics on the first non-UTF-8
+/// variable anywhere in the environment; such entries are skipped instead.
+fn dependency_charset_paths(vars: impl IntoIterator<Item = (OsString, OsString)>) -> Vec<String> {
+    let mut paths: Vec<String> = vars
+        .into_iter()
+        .filter_map(|(key, value)| {
+            let key = key.into_string().ok()?;
+            let is_charset = key.starts_with("DEP_") && key.ends_with("_FLUENT_CHARSET_PATH");
+            is_charset.then(|| value.into_string().ok()).flatten()
+        })
+        .collect();
+    paths.sort();
+    paths
+}
+
+/// The closest existing ancestor of the missing directory `dir`, to watch for
+/// its creation, unless that ancestor contains `out_dir`: the build writes
+/// there, so watching it would leave the script permanently stale.
+fn missing_dir_watch_path(dir: &Path, out_dir: &Path) -> Option<PathBuf> {
+    let out_dir = fs::canonicalize(out_dir).ok()?;
+    let ancestor = dir
+        .ancestors()
+        .skip(1)
+        .map(|a| {
+            if a.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                a
+            }
+        })
+        .find(|a| a.is_dir())?;
+    let canonical = fs::canonicalize(ancestor).ok()?;
+    (!out_dir.starts_with(canonical)).then(|| ancestor.to_path_buf())
+}
+
+/// Whether `path` lies inside `base`, resolving `.` and `..` lexically (the
+/// path may not exist yet, so it cannot be canonicalised).
+fn lexically_inside(path: &Path, base: &Path) -> bool {
+    fn normalize(path: &Path) -> PathBuf {
+        let mut normalized = PathBuf::new();
+        for component in path.components() {
+            match component {
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    normalized.pop();
+                }
+                other => normalized.push(other),
+            }
+        }
+        normalized
+    }
+    normalize(path).starts_with(normalize(base))
 }
 
 /// Generates the static cache code for `fluent-zero`.
@@ -776,7 +1120,7 @@ mod tests {
 
     /// The generated `CacheEntry` expression for each message, by id.
     fn entries(source: &str) -> HashMap<String, String> {
-        static_cache_entries(&"en-US".parse().unwrap(), source)
+        static_cache_entries(&"en-US".parse().unwrap(), source, true)
             .into_iter()
             .collect()
     }
@@ -960,7 +1304,7 @@ via = Says { v }
         let file = dir.join("bad.ftl");
         fs::write(&file, "bad Value\n").unwrap();
         let panic = std::panic::catch_unwind(|| {
-            FluentZeroBuilder::process_locale_dir(&dir, "en-US", &mut BTreeSet::new())
+            FluentZeroBuilder::process_locale_dir(&dir, "en-US", &mut BTreeSet::new(), true)
         })
         .expect_err("a syntax error must fail the build");
         fs::remove_dir_all(&dir).unwrap();
@@ -1034,6 +1378,101 @@ via = Says { v }
         );
     }
 
+    fn const_names(keys: &[&str]) -> Vec<(String, String)> {
+        let keys: BTreeSet<String> = keys.iter().map(ToString::to_string).collect();
+        key_const_names(&keys)
+            .into_iter()
+            .map(|(name, key)| (key.to_string(), name))
+            .collect()
+    }
+
+    #[test]
+    fn key_constants_are_screaming_snake_case() {
+        assert_eq!(key_const_base("app-title"), "APP_TITLE");
+        assert_eq!(key_const_base("btn_submit"), "BTN_SUBMIT");
+        assert_eq!(key_const_base("menuTitle2"), "MENUTITLE2");
+        assert_eq!(key_const_base("login.tooltip"), "LOGIN_TOOLTIP");
+    }
+
+    #[test]
+    fn key_constants_are_always_valid_identifiers() {
+        assert_eq!(key_const_base("1st"), "KEY_1ST");
+        assert_eq!(key_const_base("-x"), "KEY__X");
+        assert_eq!(key_const_base(""), "KEY_");
+        assert_eq!(key_const_base("héllo"), "H_LLO");
+    }
+
+    #[test]
+    fn colliding_keys_get_deterministic_suffixes() {
+        // Byte order: "a-b" < "aB" < "a_b"; the first takes the plain name.
+        assert_eq!(
+            const_names(&["a_b", "aB", "a-b"]),
+            [
+                ("a-b".to_string(), "A_B".to_string()),
+                ("aB".to_string(), "AB".to_string()),
+                ("a_b".to_string(), "A_B_2".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn suffixes_never_take_another_keys_plain_name() {
+        // `a_b-2` owns `A_B_2`, so the clash between `a-b` and `a_b` moves on to `_3`.
+        let names = const_names(&["a-b", "a_b", "a_b-2"]);
+        assert_eq!(
+            names,
+            [
+                ("a-b".to_string(), "A_B".to_string()),
+                ("a_b".to_string(), "A_B_3".to_string()),
+                ("a_b-2".to_string(), "A_B_2".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn message_sources_document_value_and_attributes_without_comments() {
+        let sources = message_sources("# note\nlogin = Log in\n    .tooltip = Hi { $name }\n");
+        assert_eq!(
+            sources["login"],
+            "login = Log in\n    .tooltip = Hi { $name }"
+        );
+    }
+
+    #[test]
+    fn message_sources_document_each_attribute_on_its_own() {
+        let sources = message_sources(
+            "login = Log in\n    .tooltip = Hi\n    .label = Go\n    .tooltip = Dup\nsearch =\n    .placeholder = Find\n",
+        );
+        assert_eq!(sources["login.tooltip"], "login =\n    .tooltip = Hi");
+        assert_eq!(sources["login.label"], "login =\n    .label = Go");
+        assert_eq!(
+            sources["search.placeholder"],
+            "search =\n    .placeholder = Find"
+        );
+        assert!(sources.contains_key("search"));
+    }
+
+    #[test]
+    fn attribute_keys_get_constants() {
+        assert_eq!(
+            const_names(&["login", "login.tooltip", "search.aria-label"]),
+            [
+                ("login".to_string(), "LOGIN".to_string()),
+                ("login.tooltip".to_string(), "LOGIN_TOOLTIP".to_string()),
+                (
+                    "search.aria-label".to_string(),
+                    "SEARCH_ARIA_LABEL".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn fenced_text_outlasts_backtick_runs() {
+        assert_eq!(fenced_text("a = b"), "```text\na = b\n```");
+        assert_eq!(fenced_text("a = ````"), "`````text\na = ````\n`````");
+    }
+
     #[test]
     fn attributes_get_dotted_keys_and_static_values() {
         let source = "\
@@ -1063,7 +1502,7 @@ login = Log in
     #[test]
     fn repeated_attribute_names_keep_the_first() {
         let source = "m = M\n    .a = First\n    .a = Second\n";
-        let generated = static_cache_entries(&"en-US".parse().unwrap(), source);
+        let generated = static_cache_entries(&"en-US".parse().unwrap(), source, true);
         let keys: Vec<&str> = generated.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(keys, ["m", "m.a"]);
         assert_eq!(generated[1].1, static_literal("First"));
@@ -1133,5 +1572,168 @@ n = { NUMBER($count, style: \"percent\") ->
 }
 ";
         assert_eq!(charset(source), "ab");
+    }
+
+    #[test]
+    fn number_literals_are_bare_without_isolation() {
+        let entries: HashMap<_, _> =
+            static_cache_entries(&"en-US".parse().unwrap(), "n = Take { 5 } now\n", false)
+                .into_iter()
+                .collect();
+        assert_eq!(entries["n"], static_literal("Take 5 now"));
+    }
+
+    fn isolates(source: &str) -> bool {
+        let ast = parser::parse(source.to_string()).expect("test FTL must parse");
+        ast.body.iter().any(|entry| match entry {
+            ast::Entry::Message(msg) => msg
+                .value
+                .iter()
+                .chain(msg.attributes.iter().map(|a| &a.value))
+                .any(pattern_isolates),
+            ast::Entry::Term(term) => pattern_isolates(&term.value),
+            _ => false,
+        })
+    }
+
+    #[test]
+    fn detects_patterns_that_emit_isolation_marks() {
+        assert!(isolates("a = Hi { $name }\n"));
+        assert!(isolates("a = Take { 5 } now\n"));
+        assert!(isolates("a =\n    .tip = Hi { $name }\n"));
+        assert!(isolates(
+            "a = { $n ->\n    [one] { $n } file\n   *[other] many\n}\n"
+        ));
+        assert!(isolates("-t = x { $y }\n"));
+    }
+
+    #[test]
+    fn ignores_patterns_that_never_emit_isolation_marks() {
+        assert!(!isolates("a = Plain text\n"));
+        assert!(!isolates("a = { $name }\n"));
+        assert!(!isolates("a = About { -brand } and { b }\n"));
+        assert!(!isolates("a = Open {\"{\"} here\n"));
+        assert!(!isolates(
+            "a = { $n ->\n    [one] { $n }\n   *[other] many\n}\n"
+        ));
+    }
+
+    /// A fresh, empty directory under the system temp dir.
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!(
+            "fluent-zero-build-test-{}-{name}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn locale_files_are_combined_in_sorted_order() {
+        let dir = temp_dir("sorted");
+        // Created out of order so creation order cannot pass for sorting.
+        for name in ["c.ftl", "a.ftl", "b.ftl"] {
+            let id = name.trim_end_matches(".ftl");
+            fs::write(dir.join(name), format!("{id} = {id}\n")).unwrap();
+        }
+        fs::write(dir.join("notes.txt"), "ignored").unwrap();
+
+        let entries = sorted_dir_entries(&dir);
+        let names: Vec<_> = entries.iter().map(|p| p.file_name().unwrap()).collect();
+        assert_eq!(names, ["a.ftl", "b.ftl", "c.ftl", "notes.txt"]);
+
+        let source =
+            FluentZeroBuilder::process_locale_dir(&dir, "en-US", &mut BTreeSet::new(), true);
+        assert_eq!(source, "a = a\n\nb = b\n\nc = c\n\n");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn isolation_marks_join_the_charset_only_when_they_can_render() {
+        let dir = temp_dir("isolation");
+        fs::write(dir.join("main.ftl"), "a = Hi { $name }\n").unwrap();
+        let mut on = BTreeSet::new();
+        FluentZeroBuilder::process_locale_dir(&dir, "en-US", &mut on, true);
+        assert!(on.contains(&'\u{2068}') && on.contains(&'\u{2069}'));
+
+        let mut off = BTreeSet::new();
+        FluentZeroBuilder::process_locale_dir(&dir, "en-US", &mut off, false);
+        assert!(!off.contains(&'\u{2068}') && !off.contains(&'\u{2069}'));
+
+        fs::write(dir.join("main.ftl"), "a = { $name }\nb = Plain\n").unwrap();
+        let mut single = BTreeSet::new();
+        FluentZeroBuilder::process_locale_dir(&dir, "en-US", &mut single, true);
+        assert!(!single.contains(&'\u{2068}'));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn dependency_charset_paths_are_filtered_and_sorted() {
+        let vars = [
+            ("DEP_ZED_FLUENT_CHARSET_PATH", "/z.txt"),
+            ("PATH", "/usr/bin"),
+            ("DEP_ZED_OTHER", "/nope"),
+            ("DEP_ABC_FLUENT_CHARSET_PATH", "/a.txt"),
+        ]
+        .map(|(k, v)| (OsString::from(k), OsString::from(v)));
+        assert_eq!(dependency_charset_paths(vars), ["/a.txt", "/z.txt"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_environment_entries_are_skipped() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let bad = || OsString::from_vec(vec![b'D', b'E', b'P', 0xff]);
+        let vars = vec![
+            (bad(), OsString::from("/x.txt")),
+            (OsString::from("DEP_A_FLUENT_CHARSET_PATH"), bad()),
+            (
+                OsString::from("DEP_B_FLUENT_CHARSET_PATH"),
+                OsString::from("/b.txt"),
+            ),
+        ];
+        assert_eq!(dependency_charset_paths(vars), ["/b.txt"]);
+    }
+
+    #[test]
+    fn missing_locales_dir_watches_closest_existing_ancestor() {
+        let root = temp_dir("watch");
+        let out_dir = root.join("target/out");
+        fs::create_dir_all(&out_dir).unwrap();
+        fs::create_dir_all(root.join("pkg/assets")).unwrap();
+
+        assert_eq!(
+            missing_dir_watch_path(&root.join("pkg/assets/locales"), &out_dir),
+            Some(root.join("pkg/assets"))
+        );
+        assert_eq!(
+            missing_dir_watch_path(&root.join("pkg/missing/deeper/locales"), &out_dir),
+            Some(root.join("pkg"))
+        );
+        // `root` contains OUT_DIR: watching it would never be fresh.
+        assert_eq!(
+            missing_dir_watch_path(&root.join("locales"), &out_dir),
+            None
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn lexical_containment_resolves_dot_segments() {
+        let out = Path::new("/t/debug/build/x/out");
+        assert!(lexically_inside(
+            Path::new("/t/debug/build/x/out/c.txt"),
+            out
+        ));
+        assert!(lexically_inside(
+            Path::new("/t/debug/build/x/out/./a/../c.txt"),
+            out
+        ));
+        assert!(!lexically_inside(Path::new("/pkg/target/chars.txt"), out));
+        assert!(!lexically_inside(
+            Path::new("/t/debug/build/x/out/../c.txt"),
+            out
+        ));
     }
 }

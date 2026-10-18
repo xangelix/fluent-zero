@@ -387,10 +387,64 @@ pub fn lookup_dynamic<'a, B: BundleCollection + ?Sized, C: CacheStore + ?Sized>(
     lookup_core(bundles, cache, key, Some(args))
 }
 
+/// Returns whether `key` is in `sorted_keys`, which must be sorted by byte
+/// order (as the generated `__FLUENT_ZERO_KEYS` is).
+///
+/// Support for `t!`: it runs in a `const` block, so a binary search keeps the
+/// compile-time cost of each `t!` call logarithmic in the number of keys.
+#[doc(hidden)]
+#[must_use]
+pub const fn __key_exists(sorted_keys: &[&str], key: &str) -> bool {
+    let (mut low, mut high) = (0, sorted_keys.len());
+    while low < high {
+        let mid = low + (high - low) / 2;
+        match const_str_cmp(sorted_keys[mid], key) {
+            std::cmp::Ordering::Equal => return true,
+            std::cmp::Ordering::Less => low = mid + 1,
+            std::cmp::Ordering::Greater => high = mid,
+        }
+    }
+    false
+}
+
+/// `Ord for str` (byte-wise lexicographic), usable in `const` contexts.
+const fn const_str_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let mut i = 0;
+    while i < a.len() && i < b.len() {
+        if a[i] != b[i] {
+            return if a[i] < b[i] {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            };
+        }
+        i += 1;
+    }
+    if a.len() < b.len() {
+        std::cmp::Ordering::Less
+    } else if a.len() > b.len() {
+        std::cmp::Ordering::Greater
+    } else {
+        std::cmp::Ordering::Equal
+    }
+}
+
 /// The primary accessor macro for localized strings.
 ///
 /// It delegates to `lookup_static` or `lookup_dynamic` depending on whether arguments
 /// are provided.
+///
+/// # Compile-time key checking
+///
+/// A string literal key is checked at compile time against every message ID
+/// the build script found in any locale, so a typo such as `t!("app-titel")`
+/// fails the build instead of showing the raw key on screen. The check runs in
+/// a `const` item and adds nothing at run time. Keys given as any other
+/// expression (a variable, a constant such as the generated `keys::APP_TITLE`)
+/// are not checked by the macro; the generated `keys::` constants are checked
+/// by the compiler simply by existing. To pass a key that is deliberately not
+/// defined in any locale, bind it to a variable or constant first.
 ///
 /// # Examples
 ///
@@ -414,6 +468,24 @@ pub fn lookup_dynamic<'a, B: BundleCollection + ?Sized, C: CacheStore + ?Sized>(
 #[allow(clippy::crate_in_macro_def)]
 #[macro_export]
 macro_rules! t {
+    ($key:literal) => {{
+        const _: () = ::core::assert!(
+            $crate::__key_exists(crate::__FLUENT_ZERO_KEYS, $key),
+            "{}",
+            ::core::concat!("unknown Fluent message key passed to `t!`: ", $key)
+        );
+        $crate::lookup_static(&crate::LOCALES, &crate::CACHE, $key)
+    }};
+    ($key:literal, { $($k:expr => $v:expr),* $(,)? }) => {{
+        const _: () = ::core::assert!(
+            $crate::__key_exists(crate::__FLUENT_ZERO_KEYS, $key),
+            "{}",
+            ::core::concat!("unknown Fluent message key passed to `t!`: ", $key)
+        );
+        let mut args = $crate::FluentArgs::new();
+        $( args.set($k, $v); )*
+        $crate::lookup_dynamic(&crate::LOCALES, &crate::CACHE, $key, &args)
+    }};
     ($key:expr) => {
         $crate::lookup_static(
             &crate::LOCALES,
