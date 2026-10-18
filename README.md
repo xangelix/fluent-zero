@@ -99,6 +99,58 @@ fn main() {
 }
 ```
 
+## 🩺 Diagnostics
+
+### Runtime errors
+
+Lookups never panic: a missing key renders as the key itself, and a missing argument renders as `{$name}`. To see these problems in QA or telemetry, install a handler. It is a plain `fn` pointer, read only when something went wrong, so successful lookups (and the static fast path) cost exactly the same with or without it.
+
+```rust
+use fluent_zero::{LookupError, set_error_handler};
+
+set_error_handler(|error: &LookupError| match error {
+    LookupError::MissingKey { key, lang } => eprintln!("untranslated {key} ({lang})"),
+    other => eprintln!("i18n: {other}"),
+});
+```
+
+`LookupError` covers a key found in neither the current nor the fallback language (`MissingKey`), a message with attributes but no value (`MissingValue`), and partial formatting such as a missing argument (`Format`, with the `fluent-bundle` errors). A key missing from the current language but found in `en-US` is not an error. `clear_error_handler()` removes the handler.
+
+Alternatively, enable the off-by-default `tracing` feature to log every `LookupError` with `tracing::warn!` (target `fluent_zero`):
+
+```toml
+fluent-zero = { version = "0.1", features = ["tracing"] }
+```
+
+### Build errors
+
+An `.ftl` syntax error fails the build with the file, line and column of each error and the offending line:
+
+```text
+failed to parse assets/locales/en-US/main.ftl:
+assets/locales/en-US/main.ftl:2:8: Expected a token starting with "="
+2 | broken Value
+  |        ^
+```
+
+### Translation coverage
+
+The builder warns, once per locale, about message IDs present in `en-US` but missing from another locale (those fall back to `en-US` at runtime):
+
+```text
+warning: my-app@0.1.0: fr-FR is missing 12 of 40 messages from en-US: about, greeting, menu-file, menu-open, title and 7 more
+```
+
+Turn this into a build error, or silence it:
+
+```rust
+use fluent_zero_build::{FluentZeroBuilder, MissingTranslations};
+
+FluentZeroBuilder::new("assets/locales")
+    .missing_translations(MissingTranslations::Deny) // or Allow; default Warn
+    .generate();
+```
+
 ## 📦 Library Support & Nested Translations
 
 `fluent-zero` supports a modular architecture where libraries and dependencies manage their own translations independently, but share their end results with the caller.
