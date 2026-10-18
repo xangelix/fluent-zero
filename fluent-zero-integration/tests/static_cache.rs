@@ -126,3 +126,24 @@ fn attribute_lookups_through_t_macro() {
 
     set_lang("en-US".parse().unwrap());
 }
+
+#[test]
+fn generated_code_has_no_panic_paths() {
+    let generated = include_str!(concat!(env!("OUT_DIR"), "/static_cache.rs"));
+    for needle in [".unwrap()", ".expect(", "panic!", "unreachable!", "todo!"] {
+        assert!(
+            !generated.contains(needle),
+            "generated code contains `{needle}`"
+        );
+    }
+}
+
+#[test]
+fn bundles_initialise_and_format() {
+    for (lang, bundle) in LOCALES.entries() {
+        assert!(
+            bundle.has_message("plain"),
+            "{lang} bundle is missing `plain`"
+        );
+    }
+}
