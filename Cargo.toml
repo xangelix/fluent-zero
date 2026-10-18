@@ -1,3 +1,18 @@
 [workspace]
 resolver = "3"
 members = ["fluent-zero", "fluent-zero-build", "fluent-zero-integration"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/xangelix/fluent-zero"
+categories = [
+    "localization",
+    "internationalization",
+    "gui",
+    "caching",
+    "game-development",
+]
+keywords = ["fluent", "i18n", "zero-allocation", "static", "l10n"]
