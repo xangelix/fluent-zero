@@ -240,7 +240,7 @@ Your optimized `.ttf` files are now securely located in `OUT_DIR` and can be sea
 
 ## 🧠 How it Works
 
-1. **Build Time**: `fluent-zero-build` scans your `.ftl` files. It identifies which messages are purely static (no variables) and which are dynamic.
+1. **Build Time**: `fluent-zero-build` scans your `.ftl` files. It identifies which messages are static (their output cannot depend on runtime arguments: plain or multiline text, string and number literals, references to other static messages and terms, and selects over static selectors) and which are dynamic. Static messages are formatted at build time by the same `fluent-bundle` the runtime uses, so the embedded string is byte-identical to what the runtime would produce.
 2. **Code Gen**: It generates a Rust module containing **Perfect Hash Maps** (via `phf`) for every locale.
 
 - Static messages are compiled directly into the binary's read-only data section (`.rodata`).

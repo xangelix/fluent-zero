@@ -1,10 +1,11 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     env, fs,
     io::Write as _,
     path::{Path, PathBuf},
 };
 
+use fluent_bundle::{FluentBundle, FluentResource};
 use fluent_syntax::{ast, parser, unicode::unescape_unicode_to_string};
 use unic_langid::LanguageIdentifier;
 
@@ -106,8 +107,8 @@ impl FluentZeroBuilder {
                 let cache_name = format!("CACHE_{sanitized_lang}");
                 let bundle_name = format!("BUNDLE_{sanitized_lang}");
 
-                let (combined_ftl_source, cache_entries) =
-                    Self::process_locale_dir(&path, &mut unique_chars);
+                let combined_ftl_source = Self::process_locale_dir(&path, &mut unique_chars);
+                let cache_entries = static_cache_entries(&lang_id, &combined_ftl_source);
 
                 Self::write_bundle_initializer(
                     &mut file,
@@ -128,12 +129,8 @@ impl FluentZeroBuilder {
         self.export_charset_data(&mut file, &unique_chars, &out_dir);
     }
 
-    fn process_locale_dir(
-        path: &Path,
-        unique_chars: &mut BTreeSet<char>,
-    ) -> (String, Vec<(String, String)>) {
+    fn process_locale_dir(path: &Path, unique_chars: &mut BTreeSet<char>) -> String {
         let mut combined_ftl_source = String::new();
-        let mut cache_entries = Vec::new();
 
         let entries = fs::read_dir(path).expect("Failed to read locale subdirectory");
 
@@ -151,11 +148,7 @@ impl FluentZeroBuilder {
                 let ast = parser::parse(source).expect("Failed to parse FTL");
                 for entry in ast.body {
                     match entry {
-                        ast::Entry::Message(msg) => {
-                            harvest_message_chars(&msg, unique_chars);
-                            cache_entries
-                                .push((msg.id.name.clone(), Self::generate_cache_entry(&msg)));
-                        }
+                        ast::Entry::Message(msg) => harvest_message_chars(&msg, unique_chars),
                         ast::Entry::Term(term) => harvest_term_chars(&term, unique_chars),
                         _ => {}
                     }
@@ -163,19 +156,7 @@ impl FluentZeroBuilder {
             }
         }
 
-        (combined_ftl_source, cache_entries)
-    }
-
-    fn generate_cache_entry(msg: &ast::Message<String>) -> String {
-        if let Some(pattern) = &msg.value
-            && pattern.elements.len() == 1
-            && let ast::PatternElement::TextElement { value } = &pattern.elements[0]
-            && !value.contains('\\')
-        {
-            format!("::fluent_zero::CacheEntry::Static(\"{value}\")")
-        } else {
-            "::fluent_zero::CacheEntry::Dynamic".to_string()
-        }
+        combined_ftl_source
     }
 
     fn write_bundle_initializer(
@@ -275,6 +256,167 @@ impl FluentZeroBuilder {
             println!("cargo:rerun-if-changed={}", charset_dest.display());
         }
     }
+}
+
+/// Builds the `(message id, CacheEntry expression)` pairs for one locale.
+///
+/// A message is static when its output cannot depend on runtime arguments:
+/// only text, string/number literals, and references to other static
+/// messages or terms, including selects over static selectors. Static
+/// messages are formatted here, at build time, by the same `fluent-bundle`
+/// the runtime uses with the same settings, so the embedded `&'static str` is
+/// byte-identical to what the runtime bundle would produce (bidi isolation
+/// marks included). Anything that fails to format cleanly stays dynamic so the
+/// runtime keeps its existing behaviour for it.
+fn static_cache_entries(lang_id: &LanguageIdentifier, source: &str) -> Vec<(String, String)> {
+    // Syntax errors were already rejected per file, so a parse error here is
+    // impossible; fall back to the partial resource rather than panicking.
+    let resource = FluentResource::try_new(source.to_owned()).unwrap_or_else(|(res, _)| res);
+    let mut bundle = FluentBundle::new(vec![lang_id.clone()]);
+    bundle.add_resource_overriding(&resource);
+
+    let mut analysis = StaticAnalysis::new(&resource);
+    let mut entries = Vec::new();
+    for entry in resource.entries() {
+        let ast::Entry::Message(msg) = entry else {
+            continue;
+        };
+        let static_value = msg
+            .value
+            .as_ref()
+            .filter(|_| analysis.message(msg.id.name, None))
+            .and_then(|pattern| {
+                let mut errors = Vec::new();
+                let value = bundle.format_pattern(pattern, None, &mut errors);
+                errors.is_empty().then(|| value.into_owned())
+            });
+        let cache_entry = match static_value {
+            // `{:?}` on a `str` is a valid Rust string literal: quotes,
+            // backslashes and invisible characters are all escaped.
+            Some(value) => format!("::fluent_zero::CacheEntry::Static({value:?})"),
+            None => "::fluent_zero::CacheEntry::Dynamic".to_string(),
+        };
+        entries.push((msg.id.name.to_string(), cache_entry));
+    }
+    entries
+}
+
+/// Decides which messages and terms render the same text for any arguments.
+struct StaticAnalysis<'r> {
+    messages: HashMap<&'r str, &'r ast::Message<&'r str>>,
+    terms: HashMap<&'r str, &'r ast::Term<&'r str>>,
+    /// Memoised verdicts keyed by (is term, id, attribute). An entry is seeded
+    /// with `false` while it is being analysed, so reference cycles (which
+    /// fail to format anyway) resolve to dynamic instead of recursing forever.
+    verdicts: HashMap<(bool, &'r str, Option<&'r str>), bool>,
+}
+
+impl<'r> StaticAnalysis<'r> {
+    fn new(resource: &'r FluentResource) -> Self {
+        let mut messages = HashMap::new();
+        let mut terms = HashMap::new();
+        for entry in resource.entries() {
+            match entry {
+                ast::Entry::Message(msg) => {
+                    messages.insert(msg.id.name, msg);
+                }
+                ast::Entry::Term(term) => {
+                    terms.insert(term.id.name, term);
+                }
+                _ => {}
+            }
+        }
+        Self {
+            messages,
+            terms,
+            verdicts: HashMap::new(),
+        }
+    }
+
+    fn message(&mut self, id: &'r str, attribute: Option<&'r str>) -> bool {
+        let messages = &self.messages;
+        let pattern = messages.get(id).and_then(|msg| match attribute {
+            None => msg.value.as_ref(),
+            Some(name) => attribute_value(&msg.attributes, name),
+        });
+        self.verdict((false, id, attribute), pattern)
+    }
+
+    fn term(&mut self, id: &'r str, attribute: Option<&'r str>) -> bool {
+        let terms = &self.terms;
+        let pattern = terms.get(id).and_then(|term| match attribute {
+            None => Some(&term.value),
+            Some(name) => attribute_value(&term.attributes, name),
+        });
+        self.verdict((true, id, attribute), pattern)
+    }
+
+    fn verdict(
+        &mut self,
+        key: (bool, &'r str, Option<&'r str>),
+        pattern: Option<&'r ast::Pattern<&'r str>>,
+    ) -> bool {
+        if let Some(&verdict) = self.verdicts.get(&key) {
+            return verdict;
+        }
+        self.verdicts.insert(key, false);
+        let verdict = pattern.is_some_and(|pattern| self.pattern(pattern));
+        self.verdicts.insert(key, verdict);
+        verdict
+    }
+
+    fn pattern(&mut self, pattern: &'r ast::Pattern<&'r str>) -> bool {
+        pattern.elements.iter().all(|element| match element {
+            ast::PatternElement::TextElement { .. } => true,
+            ast::PatternElement::Placeable { expression } => self.expression(expression),
+        })
+    }
+
+    fn expression(&mut self, expression: &'r ast::Expression<&'r str>) -> bool {
+        match expression {
+            ast::Expression::Select { selector, variants } => {
+                self.inline(selector) && variants.iter().all(|v| self.pattern(&v.value))
+            }
+            ast::Expression::Inline(inline) => self.inline(inline),
+        }
+    }
+
+    fn inline(&mut self, inline: &'r ast::InlineExpression<&'r str>) -> bool {
+        match inline {
+            ast::InlineExpression::StringLiteral { .. }
+            | ast::InlineExpression::NumberLiteral { .. } => true,
+            ast::InlineExpression::MessageReference { id, attribute } => {
+                self.message(id.name, attribute.as_ref().map(|a| a.name))
+            }
+            // Term arguments only feed `$variables` inside the term, and any
+            // variable makes a pattern dynamic, so literal arguments are fine.
+            ast::InlineExpression::TermReference {
+                id,
+                attribute,
+                arguments,
+            } => {
+                arguments.as_ref().is_none_or(|args| {
+                    args.positional.iter().all(|a| self.inline(a))
+                        && args.named.iter().all(|a| self.inline(&a.value))
+                }) && self.term(id.name, attribute.as_ref().map(|a| a.name))
+            }
+            ast::InlineExpression::Placeable { expression } => self.expression(expression),
+            // Functions may format with runtime state (e.g. locale-aware
+            // `NUMBER`) and variables are runtime arguments by definition.
+            ast::InlineExpression::FunctionReference { .. }
+            | ast::InlineExpression::VariableReference { .. } => false,
+        }
+    }
+}
+
+fn attribute_value<'r>(
+    attributes: &'r [ast::Attribute<&'r str>],
+    name: &str,
+) -> Option<&'r ast::Pattern<&'r str>> {
+    attributes
+        .iter()
+        .find(|attribute| attribute.id.name == name)
+        .map(|attribute| &attribute.value)
 }
 
 /// Collects every character a message can render: its value, all of its
@@ -397,6 +539,115 @@ mod tests {
                 charset.contains(c),
                 "{c:?} missing from charset {charset:?}"
             );
+        }
+    }
+
+    /// The generated `CacheEntry` expression for each message, by id.
+    fn entries(source: &str) -> HashMap<String, String> {
+        static_cache_entries(&"en-US".parse().unwrap(), source)
+            .into_iter()
+            .collect()
+    }
+
+    fn static_literal(value: &str) -> String {
+        format!("::fluent_zero::CacheEntry::Static({value:?})")
+    }
+
+    const DYNAMIC: &str = "::fluent_zero::CacheEntry::Dynamic";
+
+    #[test]
+    fn plain_text_is_static() {
+        assert_eq!(entries("a = Hello\n")["a"], static_literal("Hello"));
+    }
+
+    #[test]
+    fn quotes_and_backslashes_are_escaped_and_stay_static() {
+        let entries = entries("q = Say \"hi\"\nb = C:\\path\n");
+        assert_eq!(
+            entries["q"],
+            r#"::fluent_zero::CacheEntry::Static("Say \"hi\"")"#
+        );
+        assert_eq!(
+            entries["b"],
+            r#"::fluent_zero::CacheEntry::Static("C:\\path")"#
+        );
+    }
+
+    #[test]
+    fn multiline_text_is_static() {
+        let entries = entries("m =\n    First line\n    second line\n");
+        assert_eq!(entries["m"], static_literal("First line\nsecond line"));
+    }
+
+    #[test]
+    fn string_literals_are_resolved() {
+        let entries = entries("brace = Open {\"{\"} here\nnbsp = a{\"\\u00A0\"}b\n");
+        assert_eq!(entries["brace"], static_literal("Open { here"));
+        assert_eq!(entries["nbsp"], static_literal("a\u{a0}b"));
+    }
+
+    #[test]
+    fn number_literals_keep_bundle_isolation_marks() {
+        // fluent-bundle isolates number placeables in multi-element patterns;
+        // the static value must match it byte for byte.
+        assert_eq!(
+            entries("n = Take { 5 } now\n")["n"],
+            static_literal("Take \u{2068}5\u{2069} now")
+        );
+    }
+
+    #[test]
+    fn static_terms_messages_and_selectors_are_inlined() {
+        let source = "\
+-brand = Acme
+    .gender = neuter
+about = About { -brand }
+pronoun = { -brand.gender ->
+    [neuter] it
+   *[other] they
+}
+title = { about }!
+";
+        let entries = entries(source);
+        assert_eq!(entries["about"], static_literal("About Acme"));
+        assert_eq!(entries["pronoun"], static_literal("it"));
+        assert_eq!(entries["title"], static_literal("About Acme!"));
+    }
+
+    #[test]
+    fn term_arguments_feeding_variables_are_dynamic() {
+        let source = "\
+-thing = { $case ->
+    [gen] thing's
+   *[nom] thing
+}
+a = The { -thing(case: \"gen\") }
+";
+        assert_eq!(entries(source)["a"], DYNAMIC);
+    }
+
+    #[test]
+    fn anything_touching_variables_or_functions_is_dynamic() {
+        let source = "\
+v = Hi { $name }
+f = { NUMBER(5) }
+s = { $n ->
+    [one] one
+   *[other] many
+}
+via = Says { v }
+";
+        let entries = entries(source);
+        for id in ["v", "f", "s", "via"] {
+            assert_eq!(entries[id], DYNAMIC, "{id} should be dynamic");
+        }
+    }
+
+    #[test]
+    fn broken_references_and_cycles_stay_dynamic() {
+        let entries = entries("missing = { nope }\nx = { y }\ny = { x }\nattrs =\n    .a = A\n");
+        for id in ["missing", "x", "y", "attrs"] {
+            assert_eq!(entries[id], DYNAMIC, "{id} should be dynamic");
         }
     }
 
