@@ -33,11 +33,11 @@ You need both the runtime library and the build-time code generator.
 
 ```toml
 [dependencies]
-fluent-zero = "0.1"
+fluent-zero = "0.2"
 unic-langid = "0.9"
 
 [build-dependencies]
-fluent-zero-build = "0.1"
+fluent-zero-build = "0.2"
 ```
 
 ### 2. File Structure
@@ -232,7 +232,7 @@ set_error_handler(|error: &LookupError| match error {
 Alternatively, enable the off-by-default `tracing` feature to log every `LookupError` with `tracing::warn!` (target `fluent_zero`):
 
 ```toml
-fluent-zero = { version = "0.1", features = ["tracing"] }
+fluent-zero = { version = "0.2", features = ["tracing"] }
 ```
 
 ### Build errors
