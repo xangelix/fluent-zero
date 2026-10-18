@@ -2,7 +2,8 @@
 name = "fluent-zero-integration"
 description = "End-to-end tests: real fluent-zero-build output compiled and checked against fluent-zero."
 version = "0.0.0"
-edition = "2024"
+edition.workspace = true
+rust-version.workspace = true
 publish = false
 
 [dependencies]

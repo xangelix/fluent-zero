@@ -289,7 +289,7 @@ While `fluent-zero` is faster at runtime, it comes with trade-offs compared to `
 
 - **Versioning**: the crates follow [Semantic Versioning](https://semver.org/). While on `0.x`, breaking changes bump the minor version (`0.1` to `0.2`) and are listed in `CHANGELOG.md`; patch releases are non-breaking.
 - **Generated code**: `fluent-zero` and `fluent-zero-build` are released together with the same version. Use matching versions; the generated code is only guaranteed to compile against the runtime of the same release.
-- **MSRV**: the minimum supported Rust version is the `rust-version` declared in each crate's `Cargo.toml`. It is only raised in a minor release (never a patch release) and the change is noted in `CHANGELOG.md`.
+- **MSRV**: the minimum supported Rust version is **Rust 1.88**, declared as `rust-version` in each crate's `Cargo.toml` and tested in CI. It is only raised in a minor release (never a patch release) and the change is noted in `CHANGELOG.md`.
 - **Security**: see [`SECURITY.md`](SECURITY.md) for supported versions and how to report a vulnerability privately.
 
 ## Performance
@@ -298,7 +298,7 @@ While `fluent-zero` is faster at runtime, it comes with trade-offs compared to `
 
 ## License
 
-This project is licensed under the [MIT license](https://spdx.org/licenses/MIT).
+This project is licensed under the [MIT license](LICENSE).
 
 ## Notice
 
