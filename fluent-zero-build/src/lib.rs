@@ -1,7 +1,23 @@
+//! # fluent-zero-build
+//!
+//! Build-time code generator for [`fluent-zero`](https://docs.rs/fluent-zero).
+//! Call it from `build.rs`; it compiles the `.ftl` files of every locale
+//! directory into `$OUT_DIR/static_cache.rs`, which the consuming crate
+//! `include!`s at its root.
+//!
+//! ```rust,no_run
+//! // In build.rs's `main`:
+//! fluent_zero_build::FluentZeroBuilder::new("assets/locales").generate();
+//! ```
+
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+#![deny(rustdoc::broken_intra_doc_links)]
+
 use std::{
     collections::{BTreeSet, HashMap},
-    env, fs,
-    io::Write as _,
+    env, fmt, fs,
+    io::{self, Write},
     path::{Path, PathBuf},
 };
 
@@ -9,18 +25,91 @@ use fluent_bundle::{FluentBundle, FluentResource};
 use fluent_syntax::{ast, parser, unicode::unescape_unicode_to_string};
 use unic_langid::LanguageIdentifier;
 
+/// The contract version between the generated code and the `fluent-zero`
+/// runtime; must equal `fluent_zero::__private::CODEGEN_VERSION`.
+///
+/// The generated file asserts it at compile time, so a mismatched pair of
+/// crates fails with a message saying which one to upgrade. It is a plain
+/// counter, independent of the crates' semver versions: bump it in both crates,
+/// to the same value, whenever the generated code changes what it needs from
+/// the runtime.
+const CODEGEN_VERSION: u32 = 1;
+
+/// The path the generated code uses for the runtime crate unless
+/// [`FluentZeroBuilder::crate_path`] overrides it.
+const DEFAULT_CRATE_PATH: &str = "::fluent_zero";
+
+/// Why [`FluentZeroBuilder::try_generate`] failed.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum Error {
+    /// The `OUT_DIR` environment variable is not set, i.e. the builder is not
+    /// running inside a Cargo build script.
+    MissingOutDir,
+    /// The path given to [`FluentZeroBuilder::crate_path`] is not a Rust path.
+    InvalidCratePath(String),
+    /// Reading a locale file or writing generated output failed.
+    Io {
+        /// The file or directory being read or written.
+        path: PathBuf,
+        /// The underlying error.
+        source: io::Error,
+    },
+    /// An `.ftl` file contains syntax errors.
+    Parse {
+        /// The offending file.
+        path: PathBuf,
+        /// The parser's description of every error in the file.
+        message: String,
+    },
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingOutDir => {
+                f.write_str("OUT_DIR is not set; fluent-zero-build must run from a build script")
+            }
+            Self::InvalidCratePath(path) => write!(
+                f,
+                "invalid crate path {path:?}: expected a Rust path such as \"::fluent_zero\""
+            ),
+            Self::Io { path, source } => write!(f, "{}: {source}", path.display()),
+            Self::Parse { path, message } => {
+                write!(f, "failed to parse {}: {message}", path.display())
+            }
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+/// Adapts an [`io::Error`] on `path` into an [`Error`], for `map_err`.
+fn io_err(path: &Path) -> impl FnOnce(io::Error) -> Error + '_ {
+    move |source| Error::Io {
+        path: path.to_path_buf(),
+        source,
+    }
+}
+
 /// A builder to configure and generate the static cache code for `fluent-zero`.
+#[derive(Debug, Clone)]
 pub struct FluentZeroBuilder {
     locales_dir: PathBuf,
     charset_dest: Option<PathBuf>,
+    crate_path: String,
 }
 
 impl Default for FluentZeroBuilder {
     fn default() -> Self {
-        Self {
-            locales_dir: PathBuf::from("assets/locales"),
-            charset_dest: None,
-        }
+        Self::new("assets/locales")
     }
 }
 
@@ -35,7 +124,20 @@ impl FluentZeroBuilder {
         Self {
             locales_dir: locales_dir_path.as_ref().to_path_buf(),
             charset_dest: None,
+            crate_path: DEFAULT_CRATE_PATH.to_string(),
         }
+    }
+
+    /// Sets the path the generated code uses to reach the `fluent-zero` crate.
+    ///
+    /// Defaults to `::fluent_zero`. Set it when the dependency is renamed in
+    /// `Cargo.toml`, e.g. `fz = { package = "fluent-zero", ... }` needs
+    /// `.crate_path("::fz")`. An invalid path makes
+    /// [`try_generate`](Self::try_generate) return [`Error::InvalidCratePath`].
+    #[must_use]
+    pub fn crate_path(mut self, path: impl Into<String>) -> Self {
+        self.crate_path = path.into();
+        self
     }
 
     /// Opt-in to exporting a deterministic text file containing all unique
@@ -52,16 +154,42 @@ impl FluentZeroBuilder {
     /// Consumes the builder, parses the Fluent files, aggregates IPC variables,
     /// and generates the Rust static cache code.
     ///
+    /// This is the panicking convenience over [`try_generate`](Self::try_generate),
+    /// meant for build scripts where a panic is the natural way to fail.
+    ///
     /// # Panics
     ///
-    /// Panics if the `OUT_DIR` environment variable is not set, or if critical
-    /// IO file system operations fail during compilation.
+    /// Panics with the error's message whenever [`try_generate`](Self::try_generate)
+    /// returns an error.
     pub fn generate(self) {
-        let out_dir = env::var("OUT_DIR").expect("OUT_DIR not set");
-        let dest_path = Path::new(&out_dir).join("static_cache.rs");
-        let mut file = fs::File::create(&dest_path).expect("Failed to create static_cache.rs");
+        if let Err(err) = self.try_generate() {
+            panic!("fluent-zero-build: {err}");
+        }
+    }
 
-        writeln!(&mut file, "// @generated by fluent-zero-build").unwrap();
+    /// Consumes the builder, parses the Fluent files, aggregates IPC variables,
+    /// and generates the Rust static cache code.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if `OUT_DIR` is not set, the
+    /// [`crate_path`](Self::crate_path) is invalid, an `.ftl` file fails to
+    /// parse, or reading the locales or writing the output fails.
+    pub fn try_generate(self) -> Result<(), Error> {
+        if !is_rust_path(&self.crate_path) {
+            return Err(Error::InvalidCratePath(self.crate_path));
+        }
+        let out_dir = env::var("OUT_DIR").map_err(|_| Error::MissingOutDir)?;
+        let dest_path = Path::new(&out_dir).join("static_cache.rs");
+        let mut file = fs::File::create(&dest_path).map_err(io_err(&dest_path))?;
+        let krate = self.crate_path.as_str();
+
+        writeln!(
+            &mut file,
+            "// @generated by fluent-zero-build\n\
+             const _: () = {krate}::__private::assert_codegen_version({CODEGEN_VERSION});"
+        )
+        .map_err(io_err(&dest_path))?;
 
         let mut unique_chars: BTreeSet<char> = BTreeSet::new();
 
@@ -83,11 +211,10 @@ impl FluentZeroBuilder {
         // 2. Process Local Translations (If present)
         if self.locales_dir.exists() {
             println!("cargo:rerun-if-changed={}", self.locales_dir.display());
-            let dir_entries =
-                fs::read_dir(&self.locales_dir).expect("Failed to read locales directory");
+            let dir_entries = fs::read_dir(&self.locales_dir).map_err(io_err(&self.locales_dir))?;
 
             for entry in dir_entries {
-                let entry = entry.expect("Failed to read directory entry");
+                let entry = entry.map_err(io_err(&self.locales_dir))?;
                 let path = entry.path();
 
                 if !path.is_dir() {
@@ -107,16 +234,19 @@ impl FluentZeroBuilder {
                 let cache_name = format!("CACHE_{sanitized_lang}");
                 let bundle_name = format!("BUNDLE_{sanitized_lang}");
 
-                let combined_ftl_source = Self::process_locale_dir(&path, &mut unique_chars);
-                let cache_entries = static_cache_entries(&lang_id, &combined_ftl_source);
+                let combined_ftl_source = Self::process_locale_dir(&path, &mut unique_chars)?;
+                let cache_entries = static_cache_entries(krate, &lang_id, &combined_ftl_source);
 
                 Self::write_bundle_initializer(
                     &mut file,
+                    krate,
                     &bundle_name,
                     &lang_key,
                     &combined_ftl_source,
-                );
-                Self::write_cache_map(&mut file, &cache_name, &cache_entries);
+                )
+                .map_err(io_err(&dest_path))?;
+                Self::write_cache_map(&mut file, krate, &cache_name, &cache_entries)
+                    .map_err(io_err(&dest_path))?;
 
                 bundle_entries.push((lang_key.clone(), format!("&{bundle_name}")));
                 cache_root_entries.push((lang_key, cache_name));
@@ -125,27 +255,35 @@ impl FluentZeroBuilder {
 
         // 3. Complete Code Generation & Upstream Exporting
         // This unconditionally runs to guarantee valid empty PHF maps in aggregator crates.
-        Self::write_root_maps(&mut file, &cache_root_entries, &bundle_entries);
-        self.export_charset_data(&mut file, &unique_chars, &out_dir);
+        Self::write_root_maps(&mut file, krate, &cache_root_entries, &bundle_entries)
+            .map_err(io_err(&dest_path))?;
+        self.export_charset_data(&mut file, &dest_path, &unique_chars, &out_dir)
     }
 
-    fn process_locale_dir(path: &Path, unique_chars: &mut BTreeSet<char>) -> String {
+    fn process_locale_dir(path: &Path, unique_chars: &mut BTreeSet<char>) -> Result<String, Error> {
         let mut combined_ftl_source = String::new();
 
-        let entries = fs::read_dir(path).expect("Failed to read locale subdirectory");
+        let entries = fs::read_dir(path).map_err(io_err(path))?;
 
         for file_entry in entries {
-            let file_entry = file_entry.expect("Failed to read file entry");
+            let file_entry = file_entry.map_err(io_err(path))?;
             let file_path = file_entry.path();
 
             if file_path.extension().is_some_and(|ext| ext == "ftl") {
                 println!("cargo:rerun-if-changed={}", file_path.display());
-                let source = fs::read_to_string(&file_path).expect("Failed to read FTL file");
+                let source = fs::read_to_string(&file_path).map_err(io_err(&file_path))?;
 
                 combined_ftl_source.push_str(&source);
                 combined_ftl_source.push('\n');
 
-                let ast = parser::parse(source).expect("Failed to parse FTL");
+                let ast = parser::parse(source).map_err(|(_, errors)| Error::Parse {
+                    message: errors
+                        .iter()
+                        .map(|e| format!("{e} at byte {}", e.pos.start))
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                    path: file_path.clone(),
+                })?;
                 for entry in ast.body {
                     match entry {
                         ast::Entry::Message(msg) => harvest_message_chars(&msg, unique_chars),
@@ -156,78 +294,88 @@ impl FluentZeroBuilder {
             }
         }
 
-        combined_ftl_source
+        Ok(combined_ftl_source)
     }
 
     fn write_bundle_initializer(
-        file: &mut fs::File,
+        file: &mut impl Write,
+        krate: &str,
         bundle_name: &str,
         lang_key: &str,
         combined_ftl_source: &str,
-    ) {
+    ) -> io::Result<()> {
         let escaped_ftl = format!("{combined_ftl_source:?}");
         let init_code = format!(
             "std::sync::LazyLock::new(|| {{\n\
-            \x20   let lang: ::fluent_zero::LanguageIdentifier = \"{lang_key}\".parse().unwrap();\n\
-            \x20   let mut bundle = ::fluent_zero::ConcurrentFluentBundle::new_concurrent(vec![lang]);\n\
-            \x20   let res = ::fluent_zero::FluentResource::try_new({escaped_ftl}.to_string()).expect(\"FTL Error\");\n\
+            \x20   let lang: {krate}::LanguageIdentifier = \"{lang_key}\".parse().unwrap();\n\
+            \x20   let mut bundle = {krate}::__private::ConcurrentFluentBundle::new_concurrent(vec![lang]);\n\
+            \x20   let res = {krate}::__private::FluentResource::try_new({escaped_ftl}.to_string()).expect(\"FTL Error\");\n\
             \x20   bundle.add_resource(res).expect(\"Resource Error\");\n\
             \x20   bundle\n\
             }})"
         );
         writeln!(
             file,
-            "static {bundle_name}: std::sync::LazyLock<::fluent_zero::ConcurrentFluentBundle<::fluent_zero::FluentResource>> = {init_code};"
-        ).unwrap();
+            "static {bundle_name}: std::sync::LazyLock<{krate}::__private::ConcurrentFluentBundle<{krate}::__private::FluentResource>> = {init_code};"
+        )
     }
 
-    fn write_cache_map(file: &mut fs::File, cache_name: &str, cache_entries: &[(String, String)]) {
+    fn write_cache_map(
+        file: &mut impl Write,
+        krate: &str,
+        cache_name: &str,
+        cache_entries: &[(String, String)],
+    ) -> io::Result<()> {
+        let phf_path = format!("{krate}::__private::phf");
         let mut map = phf_codegen::Map::new();
-        map.phf_path("::fluent_zero::phf");
+        map.phf_path(&phf_path);
         for (k, v) in cache_entries {
             map.entry(k.as_str(), v.as_str());
         }
         writeln!(
             file,
-            "static {cache_name}: ::fluent_zero::phf::Map<&'static str, ::fluent_zero::CacheEntry> = {};",
+            "static {cache_name}: {phf_path}::Map<&'static str, {krate}::CacheEntry> = {};",
             map.build()
-        ).unwrap();
+        )
     }
 
     fn write_root_maps(
-        file: &mut fs::File,
+        file: &mut impl Write,
+        krate: &str,
         cache_root_entries: &[(String, String)],
         bundle_entries: &[(String, String)],
-    ) {
+    ) -> io::Result<()> {
+        let phf_path = format!("{krate}::__private::phf");
         let mut root_map = phf_codegen::Map::new();
-        root_map.phf_path("::fluent_zero::phf");
+        root_map.phf_path(&phf_path);
         for (l, v) in cache_root_entries {
             root_map.entry(l.as_str(), format!("&{v}"));
         }
         writeln!(
             file,
-            "pub static CACHE: ::fluent_zero::phf::Map<&'static str, &'static ::fluent_zero::phf::Map<&'static str, ::fluent_zero::CacheEntry>> = {};",
+            "pub static CACHE: {phf_path}::Map<&'static str, &'static {phf_path}::Map<&'static str, {krate}::CacheEntry>> = {};",
             root_map.build()
-        ).unwrap();
+        )?;
 
         let mut bundle_map = phf_codegen::Map::new();
-        bundle_map.phf_path("::fluent_zero::phf");
+        bundle_map.phf_path(&phf_path);
         for (l, c) in bundle_entries {
             bundle_map.entry(l.as_str(), c.as_str());
         }
         writeln!(
             file,
-            "pub static LOCALES: ::fluent_zero::phf::Map<&'static str, &'static std::sync::LazyLock<::fluent_zero::ConcurrentFluentBundle<::fluent_zero::FluentResource>>> = {};",
+            "pub static LOCALES: {phf_path}::Map<&'static str, &'static std::sync::LazyLock<{krate}::__private::ConcurrentFluentBundle<{krate}::__private::FluentResource>>> = {};",
             bundle_map.build()
-        ).unwrap();
+        )
     }
 
     fn export_charset_data(
         &self,
-        file: &mut fs::File,
+        file: &mut impl Write,
+        dest_path: &Path,
         unique_chars: &BTreeSet<char>,
         out_dir: &str,
-    ) {
+    ) -> Result<(), Error> {
         let charset_string: String = unique_chars.iter().collect();
 
         // Embed the charset constant natively into the module.
@@ -237,7 +385,7 @@ impl FluentZeroBuilder {
              /// used across all `.ftl` files in this crate and its dependencies.\n\
              pub const CHARSET: &str = {charset_string:?};"
         )
-        .unwrap();
+        .map_err(io_err(dest_path))?;
 
         // 1. Emit absolute path for the NEXT build.rs to consume natively.
         // Cargo automatically captures this and converts it into `DEP_<LINKS>_FLUENT_CHARSET_PATH`.
@@ -251,11 +399,26 @@ impl FluentZeroBuilder {
             if let Some(parent) = charset_dest.parent() {
                 let _ = fs::create_dir_all(parent);
             }
-            write_if_changed(charset_dest, &charset_string)
-                .expect("Failed to write fluent charset file");
+            write_if_changed(charset_dest, &charset_string).map_err(io_err(charset_dest))?;
             println!("cargo:rerun-if-changed={}", charset_dest.display());
         }
+        Ok(())
     }
+}
+
+/// Whether `path` is a plain Rust path (`::a::b`, `a`, `crate::a`) that the
+/// generated code can prefix item paths with.
+fn is_rust_path(path: &str) -> bool {
+    let path = path.strip_prefix("::").unwrap_or(path);
+    !path.is_empty()
+        && path.split("::").all(|segment| {
+            let mut chars = segment.chars();
+            chars
+                .next()
+                .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+                && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+                && segment != "_"
+        })
 }
 
 /// Builds the `(message id, CacheEntry expression)` pairs for one locale.
@@ -268,7 +431,11 @@ impl FluentZeroBuilder {
 /// byte-identical to what the runtime bundle would produce (bidi isolation
 /// marks included). Anything that fails to format cleanly stays dynamic so the
 /// runtime keeps its existing behaviour for it.
-fn static_cache_entries(lang_id: &LanguageIdentifier, source: &str) -> Vec<(String, String)> {
+fn static_cache_entries(
+    krate: &str,
+    lang_id: &LanguageIdentifier,
+    source: &str,
+) -> Vec<(String, String)> {
     // Syntax errors were already rejected per file, so a parse error here is
     // impossible; fall back to the partial resource rather than panicking.
     let resource = FluentResource::try_new(source.to_owned()).unwrap_or_else(|(res, _)| res);
@@ -293,8 +460,8 @@ fn static_cache_entries(lang_id: &LanguageIdentifier, source: &str) -> Vec<(Stri
         let cache_entry = match static_value {
             // `{:?}` on a `str` is a valid Rust string literal: quotes,
             // backslashes and invisible characters are all escaped.
-            Some(value) => format!("::fluent_zero::CacheEntry::Static({value:?})"),
-            None => "::fluent_zero::CacheEntry::Dynamic".to_string(),
+            Some(value) => format!("{krate}::CacheEntry::Static({value:?})"),
+            None => format!("{krate}::CacheEntry::Dynamic"),
         };
         entries.push((msg.id.name.to_string(), cache_entry));
     }
@@ -495,7 +662,13 @@ fn extend_visible(unique_chars: &mut BTreeSet<char>, text: &str) {
     unique_chars.extend(text.chars().filter(|c| !c.is_control()));
 }
 
-/// Generates the static cache code for `fluent-zero`.
+/// Generates the static cache code for `fluent-zero` from `locales_dir_path`
+/// with the default settings; shorthand for
+/// `FluentZeroBuilder::new(locales_dir_path).generate()`.
+///
+/// # Panics
+///
+/// Panics when [`FluentZeroBuilder::generate`] does.
 pub fn generate_static_cache(locales_dir_path: &str) {
     FluentZeroBuilder::new(locales_dir_path).generate();
 }
@@ -544,7 +717,7 @@ mod tests {
 
     /// The generated `CacheEntry` expression for each message, by id.
     fn entries(source: &str) -> HashMap<String, String> {
-        static_cache_entries(&"en-US".parse().unwrap(), source)
+        static_cache_entries(DEFAULT_CRATE_PATH, &"en-US".parse().unwrap(), source)
             .into_iter()
             .collect()
     }
@@ -649,6 +822,86 @@ via = Says { v }
         for id in ["missing", "x", "y", "attrs"] {
             assert_eq!(entries[id], DYNAMIC, "{id} should be dynamic");
         }
+    }
+
+    #[test]
+    fn crate_path_prefixes_cache_entries() {
+        let entries: HashMap<_, _> =
+            static_cache_entries("::fz", &"en-US".parse().unwrap(), "a = A\nb = { $x }\n")
+                .into_iter()
+                .collect();
+        assert_eq!(entries["a"], r#"::fz::CacheEntry::Static("A")"#);
+        assert_eq!(entries["b"], "::fz::CacheEntry::Dynamic");
+    }
+
+    #[test]
+    fn crate_path_prefixes_generated_items() {
+        let mut out = Vec::new();
+        FluentZeroBuilder::write_bundle_initializer(&mut out, "::fz", "B", "en-US", "a = A")
+            .unwrap();
+        FluentZeroBuilder::write_root_maps(&mut out, "::fz", &[], &[]).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(!out.contains("fluent_zero"), "default path leaked: {out}");
+        assert!(out.contains("::fz::__private::ConcurrentFluentBundle"));
+        assert!(out.contains("::fz::__private::phf::Map"));
+    }
+
+    #[test]
+    fn validates_crate_paths() {
+        for ok in ["::fluent_zero", "fz", "crate::reexports::fz", "_fz2"] {
+            assert!(is_rust_path(ok), "{ok:?} should be accepted");
+        }
+        for bad in [
+            "",
+            "::",
+            "fz::",
+            "a::::b",
+            "2fz",
+            "fluent-zero",
+            "_",
+            "fz;",
+            "::a b",
+        ] {
+            assert!(!is_rust_path(bad), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn invalid_crate_path_is_an_error_not_a_panic() {
+        let err = FluentZeroBuilder::new("locales")
+            .crate_path("fluent-zero")
+            .try_generate()
+            .unwrap_err();
+        assert!(matches!(&err, Error::InvalidCratePath(p) if p == "fluent-zero"));
+        assert!(err.to_string().contains("\"fluent-zero\""), "{err}");
+    }
+
+    #[test]
+    fn syntax_errors_are_reported_with_the_file() {
+        let dir = env::temp_dir().join(format!("fluent-zero-build-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("bad.ftl");
+        fs::write(&file, "ok = fine\nbroken = { $x\n").unwrap();
+        let err = FluentZeroBuilder::process_locale_dir(&dir, &mut BTreeSet::new()).unwrap_err();
+        fs::remove_dir_all(&dir).unwrap();
+
+        let Error::Parse { path, message } = &err else {
+            panic!("expected a parse error, got {err:?}");
+        };
+        assert_eq!(path, &file);
+        assert!(message.contains("at byte"), "{message}");
+        assert!(err.to_string().contains("bad.ftl"), "{err}");
+        assert!(std::error::Error::source(&err).is_none());
+    }
+
+    #[test]
+    fn io_errors_carry_path_and_source() {
+        let err = io_err(Path::new("x/y.ftl"))(io::Error::new(io::ErrorKind::NotFound, "gone"));
+        assert_eq!(
+            err.to_string(),
+            format!("{}: gone", Path::new("x/y.ftl").display())
+        );
+        assert!(std::error::Error::source(&err).is_some());
     }
 
     #[test]

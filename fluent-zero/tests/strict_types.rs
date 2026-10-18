@@ -2,8 +2,10 @@ use std::{borrow::Cow, collections::HashMap};
 
 // Imports
 use fluent_zero::{
-    CacheEntry, CacheStore, ConcurrentFluentBundle, FluentArgs, FluentResource, LanguageIdentifier,
-    lookup_dynamic, lookup_static, set_lang,
+    __private::{
+        CacheStore, ConcurrentFluentBundle, FluentResource, lookup_dynamic, lookup_static,
+    },
+    CacheEntry, FluentArgs, LanguageIdentifier, set_lang,
 };
 
 // =========================================================================

@@ -66,6 +66,25 @@ fn main() {
 }
 ```
 
+For more control, use the builder. `try_generate()` returns a
+`Result<(), fluent_zero_build::Error>` (missing `OUT_DIR`, unreadable files, FTL
+syntax errors) instead of panicking like `generate()`:
+
+```rust
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    fluent_zero_build::FluentZeroBuilder::new("assets/locales")
+        // Only needed if fluent-zero is renamed in Cargo.toml,
+        // e.g. `fz = { package = "fluent-zero", version = "..." }`.
+        .crate_path("::fz")
+        .try_generate()?;
+    Ok(())
+}
+```
+
+Keep `fluent-zero` and `fluent-zero-build` on matching releases. The generated
+code checks that it was produced for the runtime it is compiled against; a
+mismatched pair fails to compile with a message saying which crate to upgrade.
+
 ### 4. Application Code
 
 In your `lib.rs` (or `main.rs`), you must include the generated file. This brings the `CACHE` and `LOCALES` statics into scope, which the `t!` macro relies on.
@@ -98,6 +117,15 @@ fn main() {
     println!("{}", welcome);
 }
 ```
+
+`fluent_zero::get_lang()` returns an `Arc<LocaleState>` snapshot of the active
+language; `.id()` gives the `LanguageIdentifier` and `.key()` its string form
+(e.g. `"fr-FR"`).
+
+Only `t!`, `set_lang`, `get_lang`, `LocaleState`, `CacheEntry`, `join_charsets`,
+`LanguageIdentifier` and `FluentArgs` are public API. The hidden
+`fluent_zero::__private` module exists for `t!` and the generated code and may
+change in any release.
 
 ## 📦 Library Support & Nested Translations
 
