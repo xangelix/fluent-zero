@@ -1,3 +1,3 @@
 [workspace]
 resolver = "3"
-members = ["fluent-zero", "fluent-zero-build"]
+members = ["fluent-zero", "fluent-zero-build", "fluent-zero-integration"]
