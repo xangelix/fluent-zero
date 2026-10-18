@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeSet, HashMap, HashSet},
     env,
     ffi::OsString,
+    fmt::Write as _,
     fs,
     io::Write as _,
     path::{Path, PathBuf},
@@ -11,24 +12,37 @@ use fluent_bundle::{FluentBundle, FluentResource};
 use fluent_syntax::{ast, parser, serializer, unicode::unescape_unicode_to_string};
 use unic_langid::LanguageIdentifier;
 
-/// The locale the runtime falls back to; its text documents the generated
-/// key constants.
+/// The locale every other locale is checked against for missing translations.
+/// It must match the runtime fallback language of `fluent-zero`.
 const FALLBACK_LOCALE: &str = "en-US";
+
+/// How many missing message IDs a coverage report names per locale.
+const COVERAGE_SAMPLE: usize = 5;
+
+/// What the builder does about messages present in the fallback locale but
+/// missing from another locale.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MissingTranslations {
+    /// Say nothing.
+    Allow,
+    /// Emit one `cargo:warning` per incomplete locale (the default).
+    #[default]
+    Warn,
+    /// Fail the build, listing every incomplete locale.
+    Deny,
+}
 
 /// A builder to configure and generate the static cache code for `fluent-zero`.
 pub struct FluentZeroBuilder {
     locales_dir: PathBuf,
     charset_dest: Option<PathBuf>,
+    missing_translations: MissingTranslations,
     use_isolating: bool,
 }
 
 impl Default for FluentZeroBuilder {
     fn default() -> Self {
-        Self {
-            locales_dir: PathBuf::from("assets/locales"),
-            charset_dest: None,
-            use_isolating: true,
-        }
+        Self::new("assets/locales")
     }
 }
 
@@ -43,8 +57,18 @@ impl FluentZeroBuilder {
         Self {
             locales_dir: locales_dir_path.as_ref().to_path_buf(),
             charset_dest: None,
+            missing_translations: MissingTranslations::default(),
             use_isolating: true,
         }
+    }
+
+    /// Sets how messages present in the fallback locale (`en-US`) but missing
+    /// from another locale are reported. Defaults to
+    /// [`MissingTranslations::Warn`].
+    #[must_use]
+    pub fn missing_translations(mut self, level: MissingTranslations) -> Self {
+        self.missing_translations = level;
+        self
     }
 
     /// Opt-in to exporting a deterministic text file containing all unique
@@ -83,8 +107,10 @@ impl FluentZeroBuilder {
     ///
     /// # Panics
     ///
-    /// Panics if the `OUT_DIR` environment variable is not set, or if critical
-    /// IO file system operations fail during compilation.
+    /// Panics if the `OUT_DIR` environment variable is not set, if critical
+    /// IO file system operations fail during compilation, if an `.ftl` file
+    /// has a syntax error (reported as `path:line:col: error`), or if
+    /// translations are missing under [`MissingTranslations::Deny`].
     pub fn generate(self) {
         let out_dir = env::var("OUT_DIR").expect("OUT_DIR not set");
         let dest_path = Path::new(&out_dir).join("static_cache.rs");
@@ -110,6 +136,7 @@ impl FluentZeroBuilder {
 
         let mut bundle_entries: Vec<(String, String)> = Vec::new();
         let mut cache_root_entries: Vec<(String, String)> = Vec::new();
+        let mut message_ids: Vec<(String, BTreeSet<String>)> = Vec::new();
         let mut all_keys: BTreeSet<String> = BTreeSet::new();
         let mut fallback_sources: HashMap<String, String> = HashMap::new();
 
@@ -158,6 +185,17 @@ impl FluentZeroBuilder {
                 );
                 Self::write_cache_map(&mut file, &cache_name, &cache_entries);
 
+                // Coverage is per message: attribute keys (`message.attribute`)
+                // are left out, so a message counts as translated once its ID is.
+                message_ids.push((
+                    lang_key.clone(),
+                    cache_entries
+                        .into_iter()
+                        .map(|(id, _)| id)
+                        .filter(|id| !id.contains('.'))
+                        .collect(),
+                ));
+
                 bundle_entries.push((lang_key.clone(), format!("&{bundle_name}")));
                 cache_root_entries.push((lang_key, cache_name));
             }
@@ -168,6 +206,8 @@ impl FluentZeroBuilder {
             // notices the locales directory being created later.
             println!("cargo:rerun-if-changed={}", watch.display());
         }
+
+        self.check_coverage(&message_ids);
 
         // 3. Complete Code Generation & Upstream Exporting
         // This unconditionally runs to guarantee valid empty PHF maps in aggregator crates.
@@ -195,7 +235,10 @@ impl FluentZeroBuilder {
                 combined_ftl_source.push('\n');
 
                 definitions.record(lang_key, &file_path, &source);
-                let ast = parser::parse(source).expect("Failed to parse FTL");
+                let ast = match parser::parse(source.clone()) {
+                    Ok(ast) => ast,
+                    Err((_, errors)) => panic!("{}", syntax_report(&file_path, &source, &errors)),
+                };
                 for entry in ast.body {
                     match entry {
                         ast::Entry::Message(msg) => {
@@ -223,6 +266,26 @@ impl FluentZeroBuilder {
         }
 
         combined_ftl_source
+    }
+
+    /// Reports message IDs of the fallback locale missing from other locales,
+    /// as configured by [`Self::missing_translations`].
+    fn check_coverage(&self, message_ids: &[(String, BTreeSet<String>)]) {
+        if self.missing_translations == MissingTranslations::Allow {
+            return;
+        }
+        let report = coverage_report(FALLBACK_LOCALE, message_ids);
+        if report.is_empty() {
+            return;
+        }
+        assert!(
+            self.missing_translations != MissingTranslations::Deny,
+            "missing translations:\n{}",
+            report.join("\n")
+        );
+        for line in report {
+            println!("cargo:warning={line}");
+        }
     }
 
     fn write_bundle_initializer(
@@ -404,6 +467,69 @@ impl FluentZeroBuilder {
             println!("cargo:rerun-if-changed={}", charset_dest.display());
         }
     }
+}
+
+/// Formats parser errors as `path:line:col: error`, each followed by the
+/// offending source line and a caret under the error position.
+fn syntax_report(path: &Path, source: &str, errors: &[parser::ParserError]) -> String {
+    let mut report = format!("failed to parse {}:", path.display());
+    for error in errors {
+        let offset = error.pos.start.min(source.len());
+        // `floor_char_boundary` is unstable; offsets from the parser are
+        // boundaries in practice, but never slice inside a character.
+        let offset = (0..=offset)
+            .rev()
+            .find(|&i| source.is_char_boundary(i))
+            .unwrap_or(0);
+        let line_start = source[..offset].rfind('\n').map_or(0, |i| i + 1);
+        let line_end = source[offset..]
+            .find('\n')
+            .map_or(source.len(), |i| offset + i);
+        let line_no = source[..line_start].matches('\n').count() + 1;
+        let column = source[line_start..offset].chars().count() + 1;
+        let line = source[line_start..line_end].trim_end_matches('\r');
+        let gutter = " ".repeat(line_no.to_string().len());
+        let caret_pad = " ".repeat(column - 1);
+        let _ = write!(
+            report,
+            "\n{}:{line_no}:{column}: {error}\n{line_no} | {line}\n{gutter} | {caret_pad}^",
+            path.display()
+        );
+    }
+    report
+}
+
+/// Lists, per locale, the message IDs of `fallback` that the locale lacks:
+/// one line per incomplete locale with a count and the first few IDs, sorted
+/// by locale. Empty when the fallback locale is absent or nothing is missing.
+fn coverage_report(fallback: &str, message_ids: &[(String, BTreeSet<String>)]) -> Vec<String> {
+    let Some((_, expected)) = message_ids.iter().find(|(lang, _)| lang == fallback) else {
+        return Vec::new();
+    };
+    let mut locales: Vec<_> = message_ids
+        .iter()
+        .filter(|(lang, _)| lang != fallback)
+        .collect();
+    locales.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut report = Vec::new();
+    for (lang, ids) in locales {
+        let missing: Vec<&str> = expected.difference(ids).map(String::as_str).collect();
+        if missing.is_empty() {
+            continue;
+        }
+        let mut line = format!(
+            "{lang} is missing {} of {} messages from {fallback}: {}",
+            missing.len(),
+            expected.len(),
+            missing[..missing.len().min(COVERAGE_SAMPLE)].join(", ")
+        );
+        if missing.len() > COVERAGE_SAMPLE {
+            let _ = write!(line, " and {} more", missing.len() - COVERAGE_SAMPLE);
+        }
+        report.push(line);
+    }
+    report
 }
 
 /// Where each message and term of one locale is defined, to reject duplicates.
@@ -1140,6 +1266,116 @@ via = Says { v }
         for id in ["missing", "x", "y", "attrs"] {
             assert_eq!(entries[id], DYNAMIC, "{id} should be dynamic");
         }
+    }
+
+    fn syntax_errors(source: &str) -> String {
+        let (_, errors) = parser::parse(source).expect_err("test FTL must not parse");
+        syntax_report(Path::new("locales/en-US/main.ftl"), source, &errors)
+    }
+
+    #[test]
+    fn syntax_errors_report_path_line_column_and_line() {
+        let report = syntax_errors("ok = Fine\nbroken Value\n");
+        assert_eq!(
+            report,
+            "failed to parse locales/en-US/main.ftl:\n\
+             locales/en-US/main.ftl:2:8: Expected a token starting with \"=\"\n\
+             2 | broken Value\n\
+             \x20 |        ^"
+        );
+        assert!(!report.contains("Junk"), "AST leaked: {report}");
+    }
+
+    #[test]
+    fn syntax_errors_count_columns_in_characters_and_list_every_error() {
+        let report = syntax_errors("a = ok\nx = Ü { 1 2 }\nb Wert\n");
+        assert!(report.contains("main.ftl:2:11: "), "{report}");
+        assert!(
+            report.contains("2 | x = Ü { 1 2 }\n  |           ^"),
+            "{report}"
+        );
+        assert!(report.contains("main.ftl:3:3: "), "{report}");
+    }
+
+    #[test]
+    fn syntax_error_fails_the_build_with_the_report() {
+        let dir = env::temp_dir().join(format!("fluent-zero-build-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("bad.ftl");
+        fs::write(&file, "bad Value\n").unwrap();
+        let panic = std::panic::catch_unwind(|| {
+            FluentZeroBuilder::process_locale_dir(&dir, "en-US", &mut BTreeSet::new(), true)
+        })
+        .expect_err("a syntax error must fail the build");
+        fs::remove_dir_all(&dir).unwrap();
+        let message = panic.downcast_ref::<String>().expect("formatted panic");
+        assert!(
+            message.contains(&format!("{}:1:5: Expected a token", file.display())),
+            "{message}"
+        );
+    }
+
+    fn ids(lang: &str, ids: &[&str]) -> (String, BTreeSet<String>) {
+        (
+            lang.to_string(),
+            ids.iter().map(ToString::to_string).collect(),
+        )
+    }
+
+    #[test]
+    fn coverage_lists_missing_ids_per_locale_sorted() {
+        let report = coverage_report(
+            "en-US",
+            &[
+                ids("fr-FR", &["a"]),
+                ids("en-US", &["a", "b", "c"]),
+                ids("de", &["a", "b", "c", "extra"]),
+                ids("cs", &["c"]),
+            ],
+        );
+        assert_eq!(
+            report,
+            [
+                "cs is missing 2 of 3 messages from en-US: a, b",
+                "fr-FR is missing 2 of 3 messages from en-US: b, c",
+            ]
+        );
+    }
+
+    #[test]
+    fn coverage_truncates_long_lists() {
+        let all: Vec<String> = (0..8).map(|i| format!("m{i}")).collect();
+        let all: Vec<&str> = all.iter().map(String::as_str).collect();
+        let report = coverage_report("en-US", &[ids("en-US", &all), ids("fr", &[])]);
+        assert_eq!(
+            report,
+            ["fr is missing 8 of 8 messages from en-US: m0, m1, m2, m3, m4 and 3 more"]
+        );
+    }
+
+    #[test]
+    fn coverage_is_silent_without_fallback_or_gaps() {
+        assert!(coverage_report("en-US", &[ids("fr", &["a"])]).is_empty());
+        assert!(coverage_report("en-US", &[ids("en-US", &["a"]), ids("fr", &["a"])]).is_empty());
+    }
+
+    #[test]
+    fn coverage_deny_fails_and_allow_is_silent() {
+        let ids = [ids("en-US", &["a"]), ids("fr", &[])];
+        FluentZeroBuilder::default()
+            .missing_translations(MissingTranslations::Allow)
+            .check_coverage(&ids);
+        let panic = std::panic::catch_unwind(|| {
+            FluentZeroBuilder::default()
+                .missing_translations(MissingTranslations::Deny)
+                .check_coverage(&ids);
+        })
+        .expect_err("deny must fail the build");
+        let message = panic.downcast_ref::<String>().expect("formatted panic");
+        assert_eq!(
+            message,
+            "missing translations:\nfr is missing 1 of 1 messages from en-US: a"
+        );
     }
 
     fn const_names(keys: &[&str]) -> Vec<(String, String)> {

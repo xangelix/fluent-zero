@@ -17,10 +17,10 @@ use std::{
     sync::{Arc, LazyLock},
 };
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 
 pub use fluent_bundle::{
-    FluentArgs, FluentResource, concurrent::FluentBundle as ConcurrentFluentBundle,
+    FluentArgs, FluentError, FluentResource, concurrent::FluentBundle as ConcurrentFluentBundle,
 };
 pub use fluent_syntax;
 pub use phf;
@@ -163,6 +163,112 @@ pub fn join_charsets(charsets: &[&str]) -> String {
     unique_chars.into_iter().collect()
 }
 
+/// A localization problem observed at runtime.
+///
+/// Lookups never fail: a missing key renders as the key itself and a broken
+/// placeable renders as best `fluent-bundle` can. These errors are only
+/// delivered to the handler installed with [`set_error_handler`] (and logged
+/// with the optional `tracing` feature) so QA and telemetry can see them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
+pub enum LookupError<'a> {
+    /// The key resolved in neither the current nor the fallback language, so
+    /// the key itself was returned. For a `message.attribute` key this also
+    /// covers a message that exists but lacks that attribute.
+    MissingKey {
+        /// The message ID, or `message.attribute` key, that was looked up.
+        key: &'a str,
+        /// The language that was active (e.g. "fr-FR").
+        lang: &'a str,
+    },
+    /// The message exists in `lang` but has no value (only attributes), so the
+    /// bare message ID cannot be rendered; look up `message.attribute` instead.
+    /// The lookup then continues with the fallback language.
+    MissingValue {
+        /// The message ID that was looked up.
+        key: &'a str,
+        /// The language whose bundle holds the value-less message.
+        lang: &'a str,
+    },
+    /// Formatting succeeded only partially, typically because of a missing or
+    /// mistyped argument. The partially formatted string was still returned.
+    Format {
+        /// The message ID that was looked up.
+        key: &'a str,
+        /// The language whose bundle formatted the message.
+        lang: &'a str,
+        /// The errors reported by `fluent-bundle`.
+        errors: &'a [FluentError],
+    },
+}
+
+impl std::fmt::Display for LookupError<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingKey { key, lang } => {
+                // Message IDs cannot contain `.`, so a dotted key is an attribute.
+                let what = if key.contains('.') {
+                    "attribute"
+                } else {
+                    "message"
+                };
+                write!(f, "missing {what} `{key}` (language {lang})")
+            }
+            Self::MissingValue { key, lang } => {
+                write!(f, "message `{key}` has no value (language {lang})")
+            }
+            Self::Format { key, lang, errors } => {
+                write!(f, "failed to format message `{key}` (language {lang})")?;
+                for (i, error) in errors.iter().enumerate() {
+                    f.write_str(if i == 0 { ": " } else { "; " })?;
+                    write!(f, "{error}")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl std::error::Error for LookupError<'_> {}
+
+/// Signature of a handler installed with [`set_error_handler`].
+pub type ErrorHandler = fn(&LookupError<'_>);
+
+/// The installed error handler, if any. Only read on error paths, so an unset
+/// handler costs nothing on successful lookups.
+static ERROR_HANDLER: ArcSwapOption<ErrorHandler> = ArcSwapOption::const_empty();
+
+/// Installs a process-wide handler that is called for every [`LookupError`].
+///
+/// The handler runs synchronously on the thread doing the lookup, so keep it
+/// cheap (e.g. log or bump a counter). Replaces any previous handler.
+///
+/// # Example
+///
+/// ```rust
+/// fluent_zero::set_error_handler(|error| eprintln!("i18n: {error}"));
+/// ```
+pub fn set_error_handler(handler: ErrorHandler) {
+    ERROR_HANDLER.store(Some(Arc::new(handler)));
+}
+
+/// Removes the handler installed with [`set_error_handler`].
+pub fn clear_error_handler() {
+    ERROR_HANDLER.store(None);
+}
+
+/// Delivers `error` to the installed handler and, with the `tracing` feature,
+/// to `tracing`. Kept out of line so the lookup functions stay small.
+#[cold]
+#[inline(never)]
+fn report(error: &LookupError<'_>) {
+    #[cfg(feature = "tracing")]
+    tracing::warn!(target: "fluent_zero", "{error}");
+    if let Some(handler) = &*ERROR_HANDLER.load() {
+        handler(error);
+    }
+}
+
 /// Core internal helper resolving entries efficiently, eliminating fallback duplicate closures.
 #[inline]
 fn resolve_entry<'a, B: BundleCollection + ?Sized, C: CacheStore + ?Sized>(
@@ -180,11 +286,26 @@ fn resolve_entry<'a, B: BundleCollection + ?Sized, C: CacheStore + ?Sized>(
             // names an attribute (`message.attribute`). Only this cold path
             // splits the key; static entries never get here.
             let pattern = match key.split_once('.') {
-                None => bundle.get_message(key)?.value()?,
+                None => {
+                    let msg = bundle.get_message(key)?;
+                    let Some(pattern) = msg.value() else {
+                        report(&LookupError::MissingValue { key, lang });
+                        return None;
+                    };
+                    pattern
+                }
                 Some((id, attribute)) => bundle.get_message(id)?.get_attribute(attribute)?.value(),
             };
             let mut errors = vec![];
-            Some(bundle.format_pattern(pattern, args, &mut errors))
+            let value = bundle.format_pattern(pattern, args, &mut errors);
+            if !errors.is_empty() {
+                report(&LookupError::Format {
+                    key,
+                    lang,
+                    errors: &errors,
+                });
+            }
+            Some(value)
         }
     }
 }
@@ -213,6 +334,10 @@ fn lookup_core<'a, B: BundleCollection + ?Sized, C: CacheStore + ?Sized>(
     }
 
     // 3. Miss
+    report(&LookupError::MissingKey {
+        key,
+        lang: current_key,
+    });
     Cow::Borrowed(key)
 }
 
@@ -225,7 +350,8 @@ fn lookup_core<'a, B: BundleCollection + ?Sized, C: CacheStore + ?Sized>(
 ///
 /// 1. **Current Language**: Checks if the key exists in the current language.
 /// 2. **Fallback Language**: If missing, checks the `FALLBACK_LANG_KEY` (en-US).
-/// 3. **Missing Key**: Returns the `key` itself wrapped in `Cow::Borrowed`.
+/// 3. **Missing Key**: Returns the `key` itself wrapped in `Cow::Borrowed` and
+///    reports a [`LookupError::MissingKey`] to the [error handler](set_error_handler).
 ///
 /// # Arguments
 ///
